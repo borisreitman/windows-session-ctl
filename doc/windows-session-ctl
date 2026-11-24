@@ -2,7 +2,7 @@
 # Global wrapper for windows-session-ctl: run it from any directory.
 #
 # Install:  cp doc/windows-session-ctl ~/bin/ && chmod +x ~/bin/windows-session-ctl
-# Then edit DEFAULT_ROOT below to the path of your clone (or set $WINSESSION_SESSION_CTL_ROOT).
+# Then edit DEFAULT_ROOT below to the path of your clone (or set $WINSESSION_ROOT).
 # ~/bin must be on your PATH.
 #
 # Unlike a "cd into the repo" wrapper, this keeps your current directory, so relative
@@ -12,8 +12,8 @@ set -euo pipefail
 DEFAULT_ROOT="/Users/boris/work/windows-session-ctl"   # <-- EDIT: path to your clone of the repo
 
 resolve_root() {
-  if [[ -n "${WINSESSION_SESSION_CTL_ROOT:-}" ]]; then
-    printf '%s\n' "$WINSESSION_SESSION_CTL_ROOT"; return
+  if [[ -n "${WINSESSION_ROOT:-}" ]]; then
+    printf '%s\n' "$WINSESSION_ROOT"; return
   fi
   # If this file is a symlink into the repo (ln -s .../doc/windows-session-ctl ~/bin/), use that repo.
   local source="${BASH_SOURCE[0]}"
