@@ -2,7 +2,7 @@
 # serves JSON commands on 127.0.0.1:$Port. Reach it from the Mac through an SSH tunnel; never expose it.
 param([int]$Port=8766,[string]$Dir=(Join-Path $env:USERPROFILE 'Downloads\windows-session-ctl'))
 $ErrorActionPreference='Stop'
-$Version=5
+$Version=6
 New-Item -ItemType Directory -Force $Dir | Out-Null
 Add-Type -AssemblyName System.Windows.Forms,System.Drawing,UIAutomationClient,UIAutomationTypes
 Add-Type @'
@@ -43,6 +43,14 @@ function Esc($t){ [regex]::Replace($t,'[+^%~(){}\[\]]','{$0}') }
 function Raise($w){ try{ $h=[IntPtr]$w.Current.NativeWindowHandle; [W]::ShowWindow($h,9)|Out-Null; [W]::SetForegroundWindow($h)|Out-Null }catch{}; try{$w.SetFocus()}catch{} }
 function Center($e){ $r=$e.Current.BoundingRectangle; @([int]($r.X+$r.Width/2),[int]($r.Y+$r.Height/2)) }
 
+# Pointer guard: remember the screen geometry when the tool places the pointer, and refuse pointer-relative
+# actions (click/scroll without coordinates) if the resolution changed since.
+$script:Ptr=$null
+function ScreenSig { $b=[System.Windows.Forms.SystemInformation]::VirtualScreen; "{0}x{1}@{2},{3}" -f $b.Width,$b.Height,$b.Left,$b.Top }
+function SetPtr($x,$y){ Goto $x $y; $script:Ptr=@{sig=(ScreenSig);x=[int]$x;y=[int]$y} }
+function GuardPtr($what){ if(-not $script:Ptr){ return }; $now=ScreenSig
+  if($now -ne $script:Ptr.sig){ throw "screen-changed: the screen changed from $($script:Ptr.sig) to $now since the pointer was placed at ($($script:Ptr.x),$($script:Ptr.y)), so that position no longer points at the same thing. Re-check with screenshot/tree/find and move the pointer again before the $what." } }
+
 $M=@{
  ping       = { @{ok=$true;version=$Version} }
  info       = { $b=[System.Windows.Forms.SystemInformation]::VirtualScreen; @{version=$Version;screen=@{w=$b.Width;h=$b.Height}; cursor=@{x=[System.Windows.Forms.Cursor]::Position.X;y=[System.Windows.Forms.Cursor]::Position.Y}; session=[Diagnostics.Process]::GetCurrentProcess().SessionId; user=$env:USERNAME; host=$env:COMPUTERNAME} }
@@ -63,10 +71,16 @@ $M=@{
               if($e.TryGetCurrentPattern([Windows.Automation.ValuePattern]::Pattern,[ref]$q)){@{text=$q.Current.Value}}
               elseif($e.TryGetCurrentPattern([Windows.Automation.TextPattern]::Pattern,[ref]$q)){@{text=$q.DocumentRange.GetText(-1)}}
               else{@{text=$e.Current.Name}} }
- mouse      = { param($p) switch($p.action){
-                'move'{Goto $p.x $p.y} 'click'{Goto $p.x $p.y;Btn 2 4} 'dblclick'{Goto $p.x $p.y;Btn 2 4 2} 'rclick'{Goto $p.x $p.y;Btn 8 16}
-                'drag'{Goto $p.x $p.y;[W]::mouse_event(2,0,0,0,[UIntPtr]::Zero);Start-Sleep -m 150;Goto $p.x2 $p.y2;Start-Sleep -m 100;[W]::mouse_event(4,0,0,0,[UIntPtr]::Zero)}
-                'scroll'{[W]::mouse_event(0x800,0,0,[int]$p.delta,[UIntPtr]::Zero)} default{throw "bad mouse action"} }; @{ok=$true} }
+ mouse      = { param($p) $xy=($null -ne $p.x) -and ($null -ne $p.y)
+              switch($p.action){
+                'move' { if(-not $xy){throw "move needs x y"}; SetPtr $p.x $p.y }
+                {$_ -in 'click','dblclick','rclick'} {
+                  if($xy){ SetPtr $p.x $p.y } else { if(-not $script:Ptr){ throw "no pointer position recorded: give x y, or 'mouse move x y' first" }; GuardPtr 'click' }
+                  switch($p.action){ 'click'{Btn 2 4} 'dblclick'{Btn 2 4 2} 'rclick'{Btn 8 16} } }
+                'drag' { if(-not $xy){throw "drag needs x1 y1 x2 y2"}; SetPtr $p.x $p.y; [W]::mouse_event(2,0,0,0,[UIntPtr]::Zero); Start-Sleep -m 150; Goto $p.x2 $p.y2; Start-Sleep -m 100; [W]::mouse_event(4,0,0,0,[UIntPtr]::Zero); SetPtr $p.x2 $p.y2 }
+                'scroll' { if($xy){ SetPtr $p.x $p.y } else { GuardPtr 'scroll' }; [W]::mouse_event(0x800,0,0,[int]$p.delta,[UIntPtr]::Zero) }
+                default { throw "bad mouse action '$($p.action)'" } }
+              @{ok=$true} }
  type       = { param($p) if($p.window){Raise (Win $p.window); Start-Sleep -m 250}; [Windows.Forms.SendKeys]::SendWait((Esc $p.text)); @{ok=$true} }
  key        = { param($p) if($p.window){Raise (Win $p.window); Start-Sleep -m 250}; [Windows.Forms.SendKeys]::SendWait($p.keys); @{ok=$true} }
  exec       = { param($p) $ms=if($p.timeout){[int]$p.timeout*1000}else{120000}; $utf8=New-Object Text.UTF8Encoding($false); $tmp=$null

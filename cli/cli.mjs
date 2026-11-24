@@ -14,7 +14,7 @@ const CFG_FILE = join(CFG_DIR, "config.json");
 const TOKEN_DIR = join(CFG_DIR, "tokens");
 const AGENT_PORT = 8766;
 const rdir = (t) => `C:\\Users\\${t.user}\\Downloads\\windows-session-ctl`; // install dir on the VM
-const AGENT_VERSION = 5; // keep in step with $Version in agent/agent.ps1
+const AGENT_VERSION = 6; // keep in step with $Version in agent/agent.ps1
 
 const USAGE = `Drive the Windows desktop session a user is logged into (RDP or console), over SSH.
 
@@ -34,9 +34,10 @@ const USAGE = `Drive the Windows desktop session a user is logged into (RDP or c
   windows-session-ctl gettext <window> [--control <name|id>]
   windows-session-ctl type <text> [--window <w>]    keystrokes to the focused window
   windows-session-ctl key <keys> [--window <w>]     SendKeys syntax: ^c  %{F4}  {ENTER}  ^{ESC}
-  windows-session-ctl mouse <move|click|dblclick|rclick> <x> <y>
+  windows-session-ctl mouse move <x> <y>
+  windows-session-ctl mouse <click|dblclick|rclick> [x y]   without x y: at the pointer; refused if the screen resolution changed since it was placed
   windows-session-ctl mouse drag <x1> <y1> <x2> <y2>
-  windows-session-ctl mouse scroll <delta>          120 = one notch up, -120 = down
+  windows-session-ctl mouse scroll <delta> [x y]    120 = one notch up, -120 = down; same resolution guard without x y
   windows-session-ctl screenshot [path] [--window <w>]
   windows-session-ctl launch <exe> [args]           start a program in the session, do not wait
   windows-session-ctl exec <cmd-command> [--timeout s]  run a CMD command/batch script in the session (arg, or stdin when piped), wait, print stdout; exit code passed through
@@ -213,7 +214,7 @@ switch (cmd) {
   case "key": print(await rpc("key", { keys: a[0], window: flags.window })); break;
   case "mouse": {
     const [action, ...n] = a; const v = n.map(Number);
-    print(await rpc("mouse", action === "scroll" ? { action, delta: v[0] } : { action, x: v[0], y: v[1], x2: v[2], y2: v[3] })); break;
+    print(await rpc("mouse", action === "scroll" ? { action, delta: v[0], x: v[1], y: v[2] } : { action, x: v[0], y: v[1], x2: v[2], y2: v[3] })); break;
   }
   case "exec": await runShell("cmd"); break;
   case "psexec": await runShell("powershell"); break;

@@ -167,11 +167,30 @@ started from them appear on the desktop. Output is UTF-8 in both.
 
 | Command | What it does |
 |---|---|
-| `mouse move\|click\|dblclick\|rclick <x> <y>` | Move or click at a point. |
+| `mouse move <x> <y>` | Move the pointer to a point and remember it (with the current screen size). |
+| `mouse click\|dblclick\|rclick [x y]` | Click at `x y`, or at the pointer when omitted. Without `x y` it is **refused with a `screen-changed:` error** if the screen resolution changed since the pointer was placed (see below). |
 | `mouse drag <x1> <y1> <x2> <y2>` | Press at the first point, release at the second. |
-| `mouse scroll <delta>` | Wheel at the current pointer position. `120` is one notch up, `-120` one notch down. |
+| `mouse scroll <delta> [x y]` | Wheel at `x y`, or at the pointer when omitted (same guard). `120` is one notch up, `-120` one notch down. |
 | `type <text> [--window w]` | Send text to the focused window. With `--window`, that window is brought to the front first. Special characters (`+ ^ % ~ ( ) { } [ ]`) are escaped, so the text is typed literally. |
 | `key <keys> [--window w]` | Send keys in [SendKeys syntax](https://learn.microsoft.com/dotnet/api/system.windows.forms.sendkeys): `^c` Ctrl+C, `%{F4}` Alt+F4, `{ENTER}`, `{TAB}`, `^{ESC}` Ctrl+Esc (opens Start), `{ESC}`. The Windows key cannot be sent. |
+
+### Resolution-change guard
+
+When the RDP window is resized, the client rescales the picture and then changes the VM's resolution, which re-lays-out
+every window. The pointer keeps its pixel position, so it can end up over something else. To stop a pointer-relative
+action from landing on the wrong thing, the agent records the screen size and origin whenever the tool places the pointer
+(`move`, `click x y`, `drag`, `scroll x y`). A later `click`, `dblclick`, `rclick` or `scroll` **without coordinates**
+compares the current screen with that record and, if it changed, fails with:
+
+```
+error: screen-changed: the screen changed from 1498x917@0,0 to 1376x802@0,0 since the pointer was placed at (700,400), ...
+```
+
+Nothing is clicked. Re-check with `screenshot`, `tree` or `find`, then `mouse move` again. A click with no coordinates and
+no recorded position is also an error. Commands that pass explicit coordinates are not guarded, since they place the
+pointer themselves; name-based commands (`click <window> <name>`) never use coordinates. The record is held in the agent's
+memory, so it is cleared when the agent restarts. It guards against resolution changes only, not against a window moving
+or an app re-laying-out content at the same resolution.
 
 ### Matching rules
 
