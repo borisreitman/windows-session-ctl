@@ -2,6 +2,7 @@
 // winrdp-session-ctl: drive the Windows desktop session you are logged into over RDP.
 //   Mac CLI --HTTP--> ssh tunnel (127.0.0.1:LOCAL) --> agent.ps1 inside the RDP session --> UI Automation / SendInput
 import { spawnSync, spawn } from "node:child_process";
+import net from "node:net";
 import { readFileSync, writeFileSync, mkdirSync, existsSync, chmodSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
@@ -12,6 +13,7 @@ const CFG_DIR = join(homedir(), ".config", "winrdp-session-ctl");
 const CFG_FILE = join(CFG_DIR, "config.json");
 const TOKEN_FILE = join(CFG_DIR, "token");
 const AGENT_PORT = 8766;
+const AGENT_VERSION = 2; // keep in step with $Version in agent/agent.ps1
 
 const USAGE = `Drive the Windows desktop session you are logged into over RDP.
 
@@ -65,7 +67,7 @@ async function call(t, method, params = {}, tok) {
   });
   return { status: res.status, body: await res.json() };
 }
-async function alive(t) { try { await fetch(`http://127.0.0.1:${t.port}/`, { signal: AbortSignal.timeout(1500) }); return true; } catch { return false; } }
+async function alive(t) { return new Promise((res) => { const s = net.connect(t.port, "127.0.0.1"); s.setTimeout(1500); s.on("connect", () => { s.destroy(); res(true); }); s.on("error", () => res(false)); s.on("timeout", () => { s.destroy(); res(false); }); }); }
 async function up(t) {
   if (await alive(t)) return;
   const p = spawn("ssh", [...sshBase(t), "-N", "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=30",
@@ -79,12 +81,44 @@ function fetchToken(t) {
   if (r.code !== 0 || !r.out) die("Agent token not found; run: winrdp-session-ctl install  (and be logged in over RDP)");
   mkdirSync(CFG_DIR, { recursive: true }); writeFileSync(TOKEN_FILE, r.out, { mode: 0o600 }); return r.out;
 }
+
+async function installAgent(t) {
+  console.error("Installing agent on the VM...");
+  ssh(t, "if not exist C:\\uiauto mkdir C:\\uiauto");
+  ssh(t, "schtasks /End /TN winrdp-agent");
+  const sc = spawnSync("scp", ["-q", "-i", t.key, join(ROOT, "agent", "agent.ps1"), `${t.user}@${t.host}:C:/uiauto/agent.ps1`], { encoding: "utf8" });
+  if (sc.status !== 0) die("scp failed: " + sc.stderr);
+  const mk = ssh(t, `schtasks /Create /TN winrdp-agent /F /SC ONLOGON /RU ${t.user} /IT /RL HIGHEST /TR "powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File C:\\uiauto\\agent.ps1"`);
+  if (mk.code !== 0) die("schtasks create failed: " + (mk.out || mk.err));
+  ssh(t, "del C:\\uiauto\\agent.log");
+  const run = ssh(t, "schtasks /Run /TN winrdp-agent");
+  if (run.code !== 0) die("schtasks run failed: " + (run.out || run.err));
+  for (let i = 0; i < 20; i++) {
+    await new Promise((r) => setTimeout(r, 1000));
+    const l = ssh(t, "type C:\\uiauto\\agent.log");
+    if (l.out.includes("listening")) { fetchToken(t); console.error(l.out); return; }
+  }
+  die("Agent did not start. Is anyone logged in over RDP on the VM?");
+}
+let checked = false;
+async function tryCall(t, method, params) {
+  let tok = existsSync(TOKEN_FILE) ? readFileSync(TOKEN_FILE, "utf8") : "";
+  let r = tok ? await call(t, method, params, tok).catch(() => null) : null;
+  if (!r || r.status === 401) { // stale token or agent restarted: re-read it from the VM
+    const f = ssh(t, "type C:\\uiauto\\token");
+    if (f.code === 0 && f.out) { mkdirSync(CFG_DIR, { recursive: true }); writeFileSync(TOKEN_FILE, f.out, { mode: 0o600 }); r = await call(t, method, params, f.out).catch(() => null); }
+  }
+  return r;
+}
 async function rpc(method, params = {}) {
   const t = target(); await up(t);
-  let tok = existsSync(TOKEN_FILE) ? readFileSync(TOKEN_FILE, "utf8") : fetchToken(t);
-  let r = await call(t, method, params, tok).catch(() => null);
-  if (!r || r.status === 401) { tok = fetchToken(t); r = await call(t, method, params, tok).catch(() => null); }
-  if (!r) die("Agent not answering. Is an RDP session logged in? Try: winrdp-session-ctl install");
+  if (!checked) { // bootstrap or update on demand: missing, unreachable or older agent -> copy it over SSH
+    checked = true;
+    const p = await tryCall(t, "ping", {});
+    if (!p || !p.body.ok || (p.body.result.version || 0) < AGENT_VERSION) await installAgent(t);
+  }
+  const r = await tryCall(t, method, params);
+  if (!r) die("Agent not answering. Is an RDP session logged in on the VM?");
   if (!r.body.ok) die(`error: ${r.body.error}`);
   return r.body.result;
 }
@@ -106,20 +140,7 @@ switch (cmd) {
     if (a.length === 2) { c[a[0]] = a[1]; mkdirSync(CFG_DIR, { recursive: true }); writeFileSync(CFG_FILE, JSON.stringify(c, null, 2)); }
     print(c); break;
   }
-  case "install": {
-    const t = target();
-    ssh(t, "if not exist C:\\uiauto mkdir C:\\uiauto");
-    ssh(t, "schtasks /End /TN winrdp-agent");
-    const sc = spawnSync("scp", ["-q", "-i", t.key, join(ROOT, "agent", "agent.ps1"), `${t.user}@${t.host}:C:/uiauto/agent.ps1`], { encoding: "utf8" });
-    if (sc.status !== 0) die("scp failed: " + sc.stderr);
-    const mk = ssh(t, `schtasks /Create /TN winrdp-agent /F /SC ONLOGON /RU ${t.user} /IT /RL HIGHEST /TR "powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File C:\\uiauto\\agent.ps1"`);
-    if (mk.code !== 0) die("schtasks create failed: " + (mk.out || mk.err));
-    const run = ssh(t, "schtasks /Run /TN winrdp-agent");
-    if (run.code !== 0) die("schtasks run failed: " + (run.out || run.err));
-    try { rmToken(); } catch {}
-    for (let i = 0; i < 20; i++) { await new Promise((r) => setTimeout(r, 1000)); const l = ssh(t, "type C:\\uiauto\\agent.log"); if (l.out.includes("listening")) { console.log(l.out); process.exit(0); } }
-    die("Agent did not report in. Is anyone logged in over RDP on the VM?");
-  }
+  case "install": { await installAgent(target()); break; }
   case "up": await up(target()); console.log("tunnel up"); break;
   case "down": spawnSync("pkill", ["-f", `127.0.0.1:${AGENT_PORT}.*${target().host}`]); console.log("tunnel down"); break;
   case "status": { const t = target(); const tun = await alive(t); let info = null; if (tun) info = await rpc("info").catch(() => null); print({ host: t.host, tunnel: tun, agent: !!info, ...(info || {}) }); break; }
@@ -145,4 +166,3 @@ switch (cmd) {
   case "raw": print(await rpc(a[0], a[1] ? JSON.parse(a[1]) : {})); break;
   default: console.error(`Unknown command: ${cmd}\n`); console.log(USAGE); process.exit(1);
 }
-function rmToken() { try { writeFileSync(TOKEN_FILE, ""); } catch {} }

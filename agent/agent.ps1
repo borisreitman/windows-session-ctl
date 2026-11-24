@@ -2,6 +2,7 @@
 # serves JSON commands on 127.0.0.1:$Port. Reach it from the Mac through an SSH tunnel; never expose it.
 param([int]$Port=8766,[string]$Dir='C:\uiauto')
 $ErrorActionPreference='Stop'
+$Version=2
 New-Item -ItemType Directory -Force $Dir | Out-Null
 Add-Type -AssemblyName System.Windows.Forms,System.Drawing,UIAutomationClient,UIAutomationTypes
 Add-Type @'
@@ -43,8 +44,8 @@ function Raise($w){ try{ $h=[IntPtr]$w.Current.NativeWindowHandle; [W]::ShowWind
 function Center($e){ $r=$e.Current.BoundingRectangle; @([int]($r.X+$r.Width/2),[int]($r.Y+$r.Height/2)) }
 
 $M=@{
- ping       = { @{ok=$true} }
- info       = { $b=[System.Windows.Forms.SystemInformation]::VirtualScreen; @{screen=@{w=$b.Width;h=$b.Height}; cursor=@{x=[System.Windows.Forms.Cursor]::Position.X;y=[System.Windows.Forms.Cursor]::Position.Y}; session=[Diagnostics.Process]::GetCurrentProcess().SessionId; user=$env:USERNAME; host=$env:COMPUTERNAME} }
+ ping       = { @{ok=$true;version=$Version} }
+ info       = { $b=[System.Windows.Forms.SystemInformation]::VirtualScreen; @{version=$Version;screen=@{w=$b.Width;h=$b.Height}; cursor=@{x=[System.Windows.Forms.Cursor]::Position.X;y=[System.Windows.Forms.Cursor]::Position.Y}; session=[Diagnostics.Process]::GetCurrentProcess().SessionId; user=$env:USERNAME; host=$env:COMPUTERNAME} }
  windows    = { $l=@(); foreach($w in $UIA::RootElement.FindAll($Sc::Children,$All)){ $c=$w.Current; if($c.Name -and -not $c.IsOffscreen){ $o=Node $w; $o.class=$c.ClassName; $o.pid=$c.ProcessId; $l+=,$o } }; ,$l }
  tree       = { param($p) $w=Win $p.window; $max=if($p.depth){[int]$p.depth}else{8}; Walk $w 0 $max @{n=0} }
  find       = { param($p) $w=Win $p.window; $l=@(); foreach($e in $w.FindAll($Sc::Descendants,$All)){ $c=$e.Current; if($c.Name -like "*$($p.query)*" -or $c.AutomationId -like "*$($p.query)*"){ $l+=,(Node $e) } }; ,$l }
