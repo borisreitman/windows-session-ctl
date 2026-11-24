@@ -29,9 +29,8 @@ you / agent --> CLI (Mac) --HTTP--> SSH tunnel --> agent.ps1 (inside your RDP se
 
 ```bash
 cd ~/work/windows-session-ctl
-node cli/cli.mjs config host entelecheia-win11-test.eastus.cloudapp.azure.com
-node cli/cli.mjs config key ~/.ssh/azure_test_vm
-# user defaults to azureuser; set it with: config user <name>
+node cli/cli.mjs profile add win11 --host entelecheia-win11-test.eastus.cloudapp.azure.com --key ~/.ssh/azure_test_vm
+# --user defaults to azureuser. With a single profile it is used automatically.
 
 # stay logged in over RDP; the first command bootstraps the agent:
 node cli/cli.mjs windows
@@ -62,7 +61,7 @@ windows-session-ctl windows
    Mac then forwards, encrypted, to the agent on the VM. The agent only listens on the VM's loopback address and the NSG
    has no rule for 8766, so SSH is the only way in. The tunnel stays up between commands; `down` closes it.
 4. **Auth.** The agent generates a random token at each start and writes it to `token` next to the script (file ACL:
-   the VM user and SYSTEM only). The CLI reads it over SSH, caches it in `~/.config/windows-session-ctl/token` (mode
+   the VM user and SYSTEM only). The CLI reads it over SSH, caches it per profile in `~/.config/windows-session-ctl/tokens/<profile>.token` (mode
    0600), and sends it as the `X-Token` header. If the agent restarts, the 401 triggers a token refetch automatically.
 
 ### Automatic install and update
@@ -96,8 +95,9 @@ Run `node cli/cli.mjs` with no arguments (or `help`) for the built-in usage text
 
 | Command | What it does |
 |---|---|
-| `config` | Print the stored config. |
-| `config host\|user\|key\|port <value>` | Set the SSH target (stored in `~/.config/windows-session-ctl/config.json`). |
+| `profile add <name> --host H [--user U] [--key K] [--port P]` | Save a target machine (stored in `~/.config/windows-session-ctl/config.json`). Re-running with the same name updates it. The local tunnel port is assigned automatically (8766, 8767, …) unless you pass `--port`. |
+| `profile list` (alias `profiles`) / `profile rm <name>` | List profiles / remove one (closes its tunnel and deletes its cached token). |
+| `--profile <name>` / `-p <name>` | Run any command against that profile. A unique name prefix is enough. Also `$WINSESSION_PROFILE`. |
 | `install` | Copy the agent to the VM, register the logon task, (re)start it. Normally implicit. |
 | `up` / `down` | Open / close the SSH tunnel. Other commands open it on demand. |
 | `status` | `{host, tunnel, agent, version, session, screen, user}`. Does **not** bootstrap the agent; it only reports. |
@@ -195,18 +195,36 @@ screenshot --window "My App"         # only when you need to see it (visual chec
 Re-run `tree` or `find` after each action that changes the UI; names and rectangles move. If a control has no useful
 name or `id` in `tree`, fall back to `mouse click` using the `rect` from `tree` (centre = `x + w/2`, `y + h/2`).
 
-## Configuration
+## Profiles
 
-| Setting | Env var | Config key | Default |
-|---|---|---|---|
-| VM host | `WINSESSION_HOST` | `host` | none (required) |
-| SSH user | `WINSESSION_USER` | `user` | `azureuser` |
-| SSH key | `WINSESSION_KEY` | `key` | `~/.ssh/id_ed25519` |
-| Local tunnel port | `WINSESSION_PORT` | `port` | `8766` |
+A profile is a named target machine: SSH host, user (default `azureuser`), key (default `~/.ssh/id_ed25519`), and its own
+local tunnel port.
 
-Environment variables override the config file. The remote agent port is fixed at 8766. The tool targets one VM at a
-time. To switch, give the second VM its own `WINSESSION_PORT` (a tunnel on the same local port belongs to the previous host),
-or run `down` first.
+```bash
+windows-session-ctl profile add win11 --host vm1.example.com --key ~/.ssh/vm1
+windows-session-ctl profile add build --host vm2.example.com --user builder --key ~/.ssh/vm2
+windows-session-ctl profile list
+windows-session-ctl -p build windows
+WINSESSION_PROFILE=win11 windows-session-ctl psexec 'Get-Date'
+```
+
+**Which profile is used** (first match wins):
+
+1. `--profile` / `-p`, or `$WINSESSION_PROFILE`. A unique prefix of the name is accepted.
+2. The only profile, if exactly one is configured. This is the "single session" case: no flag needed.
+3. Otherwise the command fails and lists the profile names. The tool never guesses between several.
+
+Each profile has its own SSH tunnel (local port), cached token, and agent on its machine, so two machines can be driven
+at the same time from different terminals. `down` closes the tunnel of the selected profile only.
+
+An older single-target config (`host`/`user`/`key` at the top level) is converted to a profile named `default`
+automatically the first time the CLI runs.
+
+**Ad hoc target.** Setting `WINSESSION_HOST` (with optional `WINSESSION_USER`, `WINSESSION_KEY`, `WINSESSION_PORT`)
+bypasses profiles for that command, which is handy in scripts and CI.
+
+One profile is one machine and one user. Driving two different users on the same VM is not supported: the agent uses a
+fixed port and install folder per user, and the logon task runs for one user.
 
 ## Security
 

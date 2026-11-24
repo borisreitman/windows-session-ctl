@@ -3,7 +3,7 @@
 //   Mac CLI --HTTP--> ssh tunnel (127.0.0.1:LOCAL) --> agent.ps1 inside the RDP session --> UI Automation / SendInput
 import { spawnSync, spawn } from "node:child_process";
 import net from "node:net";
-import { readFileSync, writeFileSync, mkdirSync, existsSync, chmodSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,14 +11,16 @@ import { fileURLToPath } from "node:url";
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const CFG_DIR = join(homedir(), ".config", "windows-session-ctl");
 const CFG_FILE = join(CFG_DIR, "config.json");
-const TOKEN_FILE = join(CFG_DIR, "token");
+const TOKEN_DIR = join(CFG_DIR, "tokens");
 const AGENT_PORT = 8766;
 const rdir = (t) => `C:\\Users\\${t.user}\\Downloads\\windows-session-ctl`; // install dir on the VM
 const AGENT_VERSION = 5; // keep in step with $Version in agent/agent.ps1
 
-const USAGE = `Drive the Windows desktop session you are logged into over RDP.
+const USAGE = `Drive the Windows desktop session a user is logged into (RDP or console), over SSH.
 
-  windows-session-ctl config [host|user|key|port <value>]   show / set the target VM
+  windows-session-ctl profile add <name> --host H [--user U] [--key K] [--port P]   save a target machine
+  windows-session-ctl profile list | rm <name>      (alias: profiles)
+  windows-session-ctl --profile <name> <command>    pick a profile (-p, or $WINSESSION_PROFILE); optional when only one exists
   windows-session-ctl install            copy the agent to the VM, register it to start at logon, start it
   windows-session-ctl up | down          open / close the SSH tunnel (other commands open it on demand)
   windows-session-ctl status             tunnel, agent, session, screen size
@@ -42,21 +44,43 @@ const USAGE = `Drive the Windows desktop session you are logged into over RDP.
   windows-session-ctl raw <method> [json-params]
 
 Window names match exactly first, then by substring. Coordinates are screen pixels as in screenshots.
-Target: WINSESSION_HOST / WINSESSION_USER / WINSESSION_KEY env vars, or \`config\`. Prefer \`tree\`/\`find\`/\`click\` over screenshots.`;
+Profile: --profile/-p, $WINSESSION_PROFILE, or the only profile if there is just one; with several and none chosen the command fails and lists them.
+Ad hoc: WINSESSION_HOST (+ _USER, _KEY, _PORT) bypasses profiles. Prefer \`tree\`/\`find\`/\`click\` over screenshots.`;
 
 const die = (m) => { console.error(m); process.exit(1); };
-const loadCfg = () => (existsSync(CFG_FILE) ? JSON.parse(readFileSync(CFG_FILE, "utf8")) : {});
-function target() {
-  const c = loadCfg();
-  const t = {
-    host: process.env.WINSESSION_HOST || c.host,
-    user: process.env.WINSESSION_USER || c.user || "azureuser",
-    key: process.env.WINSESSION_KEY || c.key || join(homedir(), ".ssh", "id_ed25519"),
-    port: Number(process.env.WINSESSION_PORT || c.port || AGENT_PORT),
-  };
-  if (!t.host) die("No host. Run: windows-session-ctl config host <dns-name-or-ip>");
-  return t;
+const DEFAULT_USER = "azureuser", DEFAULT_KEY = join(homedir(), ".ssh", "id_ed25519");
+function loadCfg() {
+  let c = existsSync(CFG_FILE) ? JSON.parse(readFileSync(CFG_FILE, "utf8")) : {};
+  if (c.host && !c.profiles) { // legacy single-target config -> a profile named "default"
+    const { host, user, key, port } = c;
+    c = { profiles: { default: { host, user, key, port: port || AGENT_PORT } } };
+    saveCfg(c);
+  }
+  c.profiles ||= {};
+  return c;
 }
+function saveCfg(c) { mkdirSync(CFG_DIR, { recursive: true }); writeFileSync(CFG_FILE, JSON.stringify(c, null, 2) + "\n"); }
+function makeTarget(name, p) {
+  return { name, host: p.host, user: p.user || DEFAULT_USER, key: p.key || DEFAULT_KEY, port: Number(p.port || AGENT_PORT) };
+}
+function target() {
+  if (process.env.WINSESSION_HOST) { // ad hoc target, no profile
+    return makeTarget(`env-${process.env.WINSESSION_HOST}`, { host: process.env.WINSESSION_HOST, user: process.env.WINSESSION_USER,
+      key: process.env.WINSESSION_KEY, port: process.env.WINSESSION_PORT });
+  }
+  const names = Object.keys(loadCfg().profiles), profiles = loadCfg().profiles;
+  const want = flags.profile || process.env.WINSESSION_PROFILE;
+  if (want) {
+    const hit = names.includes(want) ? [want] : names.filter((n) => n.startsWith(want));
+    if (hit.length === 1) return makeTarget(hit[0], profiles[hit[0]]);
+    die(hit.length ? `Profile '${want}' is ambiguous: ${hit.join(", ")}` : `No profile '${want}'. Profiles: ${names.join(", ") || "(none)"}`);
+  }
+  if (names.length === 1) return makeTarget(names[0], profiles[names[0]]); // the single profile is used automatically
+  if (!names.length) die("No profiles. Add one: windows-session-ctl profile add <name> --host <dns-name-or-ip> [--user U] [--key K]");
+  die(`Several profiles; choose one with --profile <name> (or $WINSESSION_PROFILE): ${names.join(", ")}`);
+}
+const tokenFile = (t) => join(TOKEN_DIR, t.name.replace(/[^\w.-]/g, "_") + ".token");
+function storeToken(t, tok) { mkdirSync(TOKEN_DIR, { recursive: true }); writeFileSync(tokenFile(t), tok, { mode: 0o600 }); }
 const sshBase = (t) => ["-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-i", t.key];
 function ssh(t, remote) {
   const r = spawnSync("ssh", [...sshBase(t), `${t.user}@${t.host}`, remote], { encoding: "utf8" });
@@ -82,7 +106,7 @@ async function up(t) {
 function fetchToken(t) {
   const r = ssh(t, `type "${rdir(t)}\\token"`);
   if (r.code !== 0 || !r.out) die("Agent token not found; run: windows-session-ctl install  (and be logged in over RDP)");
-  mkdirSync(CFG_DIR, { recursive: true }); writeFileSync(TOKEN_FILE, r.out, { mode: 0o600 }); return r.out;
+  storeToken(t, r.out); return r.out;
 }
 
 async function installAgent(t) {
@@ -105,11 +129,11 @@ async function installAgent(t) {
 }
 let checked = false;
 async function tryCall(t, method, params) {
-  let tok = existsSync(TOKEN_FILE) ? readFileSync(TOKEN_FILE, "utf8") : "";
+  let tok = existsSync(tokenFile(t)) ? readFileSync(tokenFile(t), "utf8") : "";
   let r = tok ? await call(t, method, params, tok).catch(() => null) : null;
   if (!r || r.status === 401) { // stale token or agent restarted: re-read it from the VM
     const f = ssh(t, `type "${rdir(t)}\\token"`);
-    if (f.code === 0 && f.out) { mkdirSync(CFG_DIR, { recursive: true }); writeFileSync(TOKEN_FILE, f.out, { mode: 0o600 }); r = await call(t, method, params, f.out).catch(() => null); }
+    if (f.code === 0 && f.out) { storeToken(t, f.out); r = await call(t, method, params, f.out).catch(() => null); }
   }
   return r;
 }
@@ -143,23 +167,40 @@ const print = (v) => console.log(typeof v === "string" ? v : JSON.stringify(v, n
 // ---- args ----
 const argv = process.argv.slice(2);
 const flags = {}; const pos = [];
+const VALUE_FLAGS = ["--window", "--control", "--timeout", "--profile"], PROFILE_FLAGS = ["--host", "--user", "--key", "--port"];
 for (let i = 0; i < argv.length; i++) {
-  if (argv[i] === "--window" || argv[i] === "--control" || argv[i] === "--timeout") flags[argv[i].slice(2)] = argv[++i];
+  const f = argv[i] === "-p" ? "--profile" : argv[i];
+  if (VALUE_FLAGS.includes(f) || (pos[0] === "profile" && PROFILE_FLAGS.includes(f))) flags[f.slice(2)] = argv[++i];
   else pos.push(argv[i]);
 }
 const [cmd, ...a] = pos;
 if (!cmd || cmd === "help" || cmd === "--help") { console.log(USAGE); process.exit(cmd ? 0 : 1); }
 
 switch (cmd) {
-  case "config": {
-    const c = loadCfg();
-    if (a.length === 2) { c[a[0]] = a[1]; mkdirSync(CFG_DIR, { recursive: true }); writeFileSync(CFG_FILE, JSON.stringify(c, null, 2)); }
-    print(c); break;
+  case "profile": case "profiles": {
+    const c = loadCfg(); const sub = cmd === "profiles" ? "list" : a[0] || "list"; const name = a[1];
+    if (sub === "add") {
+      if (!name || !flags.host) die("usage: profile add <name> --host H [--user U] [--key K] [--port P]");
+      if (!/^[\w.-]+$/.test(name)) die("profile names may use letters, digits, . _ - only");
+      const used = new Set(Object.entries(c.profiles).filter(([n]) => n !== name).map(([, p]) => Number(p.port)));
+      let port = Number(flags.port || c.profiles[name]?.port || 0);
+      if (!port) { port = AGENT_PORT; while (used.has(port)) port++; }
+      if (used.has(port)) die(`local port ${port} is used by another profile`);
+      c.profiles[name] = { host: flags.host, user: flags.user || DEFAULT_USER, key: flags.key || DEFAULT_KEY, port };
+      saveCfg(c);
+    } else if (sub === "rm") {
+      if (!c.profiles[name]) die(`No profile '${name}'`);
+      const t = makeTarget(name, c.profiles[name]);
+      spawnSync("pkill", ["-f", `${t.port}:127.0.0.1:${AGENT_PORT} ${t.user}@${t.host}`]);
+      rmSync(tokenFile(t), { force: true }); delete c.profiles[name]; saveCfg(c);
+    } else if (sub !== "list") die("usage: profile add|list|rm");
+    print(Object.entries(c.profiles).map(([n, p]) => ({ name: n, host: p.host, user: p.user || DEFAULT_USER, key: p.key || DEFAULT_KEY, localPort: p.port })));
+    break;
   }
   case "install": { await installAgent(target()); break; }
   case "up": await up(target()); console.log("tunnel up"); break;
-  case "down": spawnSync("pkill", ["-f", `127.0.0.1:${AGENT_PORT}.*${target().host}`]); console.log("tunnel down"); break;
-  case "status": { const t = target(); const tun = await alive(t); let info = null; if (tun) info = await rpc("info").catch(() => null); print({ host: t.host, tunnel: tun, agent: !!info, ...(info || {}) }); break; }
+  case "down": { const t = target(); spawnSync("pkill", ["-f", `${t.port}:127.0.0.1:${AGENT_PORT} ${t.user}@${t.host}`]); console.log(`tunnel down (${t.name})`); break; }
+  case "status": { const t = target(); const tun = await alive(t); let info = null; if (tun) info = await rpc("info").catch(() => null); print({ profile: t.name, host: t.host, tunnel: tun, agent: !!info, ...(info || {}) }); break; }
   case "info": print(await rpc("info")); break;
   case "windows": print(await rpc("windows")); break;
   case "tree": print(await rpc("tree", { window: a[0], depth: a[1] })); break;
