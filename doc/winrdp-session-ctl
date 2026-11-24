@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Run winrdp-session-ctl from any cwd. Copy to ~/bin and adjust DEFAULT_ROOT.
+set -euo pipefail
+DEFAULT_ROOT="/Users/boris/work/winrdp-session-ctl"
+ROOT="${WINRDP_SESSION_CTL_ROOT:-$DEFAULT_ROOT}"
+exec node "$ROOT/cli/cli.mjs" "$@"
