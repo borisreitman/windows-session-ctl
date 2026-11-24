@@ -12,8 +12,8 @@ you / agent --> CLI (Mac) --HTTP--> SSH tunnel --> agent.ps1 (inside your RDP se
 - **Structure first, pixels last.** `windows`, `tree`, `find`, `click`, `settext` and `gettext` use Windows UI Automation
   (UIA), the accessibility API. They address controls by name, so no coordinates and no screenshots are needed. Raw
   `mouse`, `type`, `key` and `screenshot` remain for apps that UIA cannot see (games, some custom-drawn UIs).
-- **Nothing to install by hand.** The first command copies the agent to the VM over SSH, registers it, and starts it. A
-  newer version of the tool updates an older agent the same way.
+- **Explicit install, easy upgrade.** `install` puts the agent on the VM over SSH (a script, no software); `upgrade` replaces
+  it later using the existing connection. Neither ever happens implicitly.
 - **It acts in the session you are looking at.** Whatever you see in your RDP window is what the tool sees and drives.
 
 ## Requirements
@@ -32,7 +32,10 @@ cd ~/work/windows-session-ctl
 node cli/cli.mjs profile add win11 --host entelecheia-win11-test.eastus.cloudapp.azure.com --key ~/.ssh/azure_test_vm
 # --user defaults to azureuser. With a single profile it is used automatically.
 
-# stay logged in over RDP; the first command bootstraps the agent:
+# stay logged in over RDP, then install the agent on the VM (one time):
+node cli/cli.mjs install
+
+# from now on:
 node cli/cli.mjs windows
 node cli/cli.mjs tree Notepad
 node cli/cli.mjs settext Notepad "hello"
@@ -64,15 +67,19 @@ windows-session-ctl windows
    the VM user and SYSTEM only). The CLI reads it over SSH, caches it per profile in `~/.config/windows-session-ctl/tokens/<profile>.token` (mode
    0600), and sends it as the `X-Token` header. If the agent restarts, the 401 triggers a token refetch automatically.
 
-### Automatic install and update
+### Install and upgrade (always explicit)
 
-Before the first command in each CLI run, the CLI pings the agent. If the agent is unreachable, or reports a version
-lower than the CLI's `AGENT_VERSION`, the CLI reinstalls it: stop the task, `scp` the script, create the task, start it,
-wait for `agent.log` to say it is listening, fetch the token. The install is also available explicitly with `install`
-(useful to force a restart). The agent never updates itself; replacement always goes through SSH, so a broken agent can
-always be replaced.
+Nothing is installed or changed on the VM unless you run one of these:
 
-When you change `agent/agent.ps1`, bump `$Version` there and `AGENT_VERSION` in `cli/cli.mjs` together.
+| Command | When | What it does |
+|---|---|---|
+| `install` | First time on a machine, or when no agent answers | Stop any old task, `scp` the script, register the logon task, start it, wait for `agent.log` to say it is listening, fetch the token. Refuses if an agent already answers (use `upgrade`). |
+| `upgrade [--force]` | An agent is running and the CLI has a newer one | Using the existing profile and connection, compare versions and, if the agent is older, replace it the same way. No-op when it is current; `--force` reinstalls anyway. Fails with a pointer to `install` if no agent answers. |
+
+Every other command only **checks**: if no agent answers it stops with `The agent is not running on '<profile>'. Install it first: …`, and if the agent is older than the CLI it prints a `warning:` on stderr and carries on (a method added in a newer agent may then fail with `unknown method`; run `upgrade`). `status` shows `version`, `expectedVersion` and `upToDate`.
+
+Install and upgrade both use SSH, and the agent never updates itself, so a broken agent can always be replaced. When you
+change `agent/agent.ps1`, bump `$Version` there and `AGENT_VERSION` in `cli/cli.mjs` together.
 
 ### What lives on the VM
 
@@ -98,9 +105,10 @@ Run `node cli/cli.mjs` with no arguments (or `help`) for the built-in usage text
 | `profile add <name> --host H [--user U] [--key K] [--port P]` | Save a target machine (stored in `~/.config/windows-session-ctl/config.json`). Re-running with the same name updates it. The local tunnel port is assigned automatically (8766, 8767, …) unless you pass `--port`. |
 | `profile list` (alias `profiles`) / `profile rm <name>` | List profiles / remove one (closes its tunnel and deletes its cached token). |
 | `--profile <name>` / `-p <name>` | Run any command against that profile. A unique name prefix is enough. Also `$WINSESSION_PROFILE`. |
-| `install` | Copy the agent to the VM, register the logon task, (re)start it. Normally implicit. |
+| `install` | First install of the agent on the VM (see *Install and upgrade*). |
+| `upgrade [--force]` | Replace the agent with this CLI's version, through the existing connection. |
 | `up` / `down` | Open / close the SSH tunnel. Other commands open it on demand. |
-| `status` | `{host, tunnel, agent, version, session, screen, user}`. Does **not** bootstrap the agent; it only reports. |
+| `status` | `{host, tunnel, agent, version, session, screen, user}`. Only reports; it never installs or changes anything. |
 | `info` | Agent version, session id, user, host, screen size, cursor position. |
 
 ### Seeing what is on screen
@@ -265,7 +273,8 @@ fixed port and install folder per user, and the logon task runs for one user.
 | Text typed into the wrong place | `type` and `key` go to whichever window has focus. Use `--window`, or `settext` / `click`. |
 | An app does not respond to `click` | It may expose no UIA patterns; use `mouse click` at the centre of its `rect`. |
 | A long `exec` / `psexec` blocks other commands | The agent handles one request at a time; raise `--timeout`, or use `launch` for long-running programs. |
-| Agent keeps reinstalling | Version mismatch: bump `$Version` in `agent.ps1` and `AGENT_VERSION` in `cli/cli.mjs` together. |
+| `warning: the agent … is version N, this CLI expects M` | The VM has an older agent. Run `upgrade`. If it persists after upgrading, `$Version` in `agent.ps1` and `AGENT_VERSION` in `cli/cli.mjs` are out of step. |
+| `The agent is not running on '…'` | No agent answers. Run `install` (someone must be logged in on the VM). |
 
 Other known limits: the Windows key cannot be sent, `type` is limited to what SendKeys can type (very large text is slow,
 so prefer `settext`), and only the session of the task's user is driven. UIA trees of some apps are huge, so use `find`
@@ -275,6 +284,6 @@ or a small `depth` instead of dumping everything.
 
 ```
 agent/agent.ps1          the in-session agent (UIA, SendInput, exec/psexec, screenshots, HTTP server)
-cli/cli.mjs              the CLI (tunnel, auto-install, commands)
+cli/cli.mjs              the CLI (profiles, tunnel, install/upgrade, commands)
 doc/windows-session-ctl   example global wrapper for ~/bin
 ```

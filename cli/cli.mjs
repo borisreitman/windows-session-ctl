@@ -21,7 +21,8 @@ const USAGE = `Drive the Windows desktop session a user is logged into (RDP or c
   windows-session-ctl profile add <name> --host H [--user U] [--key K] [--port P]   save a target machine
   windows-session-ctl profile list | rm <name>      (alias: profiles)
   windows-session-ctl --profile <name> <command>    pick a profile (-p, or $WINSESSION_PROFILE); optional when only one exists
-  windows-session-ctl install            copy the agent to the VM, register it to start at logon, start it
+  windows-session-ctl install            first install of the agent on the VM (copy, register logon task, start); never automatic
+  windows-session-ctl upgrade [--force]  replace the agent of a working connection with this CLI's version (no-op if current)
   windows-session-ctl up | down          open / close the SSH tunnel (other commands open it on demand)
   windows-session-ctl status             tunnel, agent, session, screen size
 
@@ -138,15 +139,22 @@ async function tryCall(t, method, params) {
   }
   return r;
 }
+async function agentVersion(t) { // null when no agent answers
+  await up(t); const p = await tryCall(t, "ping", {});
+  return p && p.body.ok ? p.body.result.version || 0 : null;
+}
+const me = (t) => `windows-session-ctl${t.name.startsWith("env-") ? "" : ` -p ${t.name}`}`;
 async function rpc(method, params = {}) {
   const t = target(); await up(t);
-  if (!checked) { // bootstrap or update on demand: missing, unreachable or older agent -> copy it over SSH
+  if (!checked) { // never installs or updates by itself: only reports, and points at `install`
     checked = true;
     const p = await tryCall(t, "ping", {});
-    if (!p || !p.body.ok || (p.body.result.version || 0) < AGENT_VERSION) await installAgent(t);
+    if (!p || !p.body.ok) die(`The agent is not running on '${t.name}'. Install it first: ${me(t)} install  (needs someone logged in on the VM)`);
+    const v = p.body.result.version || 0;
+    if (v < AGENT_VERSION) console.error(`warning: the agent on '${t.name}' is version ${v}, this CLI expects ${AGENT_VERSION}. Update it with: ${me(t)} upgrade`);
   }
   const r = await tryCall(t, method, params);
-  if (!r) die("Agent not answering. Is an RDP session logged in on the VM?");
+  if (!r) die("Agent not answering. Is a desktop session logged in on the VM?");
   if (!r.body.ok) die(`error: ${r.body.error}`);
   return r.body.result;
 }
@@ -170,6 +178,7 @@ const argv = process.argv.slice(2);
 const flags = {}; const pos = [];
 const VALUE_FLAGS = ["--window", "--control", "--timeout", "--profile"], PROFILE_FLAGS = ["--host", "--user", "--key", "--port"];
 for (let i = 0; i < argv.length; i++) {
+  if (argv[i] === "--force") { flags.force = true; continue; }
   const f = argv[i] === "-p" ? "--profile" : argv[i];
   if (VALUE_FLAGS.includes(f) || (pos[0] === "profile" && PROFILE_FLAGS.includes(f))) flags[f.slice(2)] = argv[++i];
   else pos.push(argv[i]);
@@ -198,10 +207,20 @@ switch (cmd) {
     print(Object.entries(c.profiles).map(([n, p]) => ({ name: n, host: p.host, user: p.user || DEFAULT_USER, key: p.key || DEFAULT_KEY, localPort: p.port })));
     break;
   }
-  case "install": { await installAgent(target()); break; }
+  case "install": { // first install only; an agent that already answers must be upgraded instead
+    const t = target(); const cur = await agentVersion(t);
+    if (cur !== null) die(`The agent is already installed on '${t.name}' (version ${cur}). To update it: ${me(t)} upgrade`);
+    await installAgent(t); print({ profile: t.name, installed: await agentVersion(t) }); break;
+  }
+  case "upgrade": { // replace the agent of an existing, working connection with this CLI's version
+    const t = target(); const cur = await agentVersion(t);
+    if (cur === null) die(`No agent answers on '${t.name}'. For a first install: ${me(t)} install`);
+    if (cur >= AGENT_VERSION && !flags.force) { print({ profile: t.name, version: cur, upgraded: false, reason: "already up to date (use --force to reinstall)" }); break; }
+    await installAgent(t); print({ profile: t.name, from: cur, to: await agentVersion(t), upgraded: true }); break;
+  }
   case "up": await up(target()); console.log("tunnel up"); break;
   case "down": { const t = target(); spawnSync("pkill", ["-f", `${t.port}:127.0.0.1:${AGENT_PORT} ${t.user}@${t.host}`]); console.log(`tunnel down (${t.name})`); break; }
-  case "status": { const t = target(); const tun = await alive(t); let info = null; if (tun) info = await rpc("info").catch(() => null); print({ profile: t.name, host: t.host, tunnel: tun, agent: !!info, ...(info || {}) }); break; }
+  case "status": { const t = target(); const tun = await alive(t); let info = null; if (tun) info = await rpc("info").catch(() => null); print({ profile: t.name, host: t.host, tunnel: tun, agent: !!info, expectedVersion: AGENT_VERSION, upToDate: !!info && (info.version || 0) >= AGENT_VERSION, ...(info || {}) }); break; }
   case "info": print(await rpc("info")); break;
   case "windows": print(await rpc("windows")); break;
   case "tree": print(await rpc("tree", { window: a[0], depth: a[1] })); break;
