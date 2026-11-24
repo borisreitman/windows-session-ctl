@@ -1,6 +1,39 @@
 #!/usr/bin/env bash
-# Run winrdp-session-ctl from any cwd. Copy to ~/bin and adjust DEFAULT_ROOT.
+# Global wrapper for winrdp-session-ctl: run it from any directory.
+#
+# Install:  cp doc/winrdp-session-ctl ~/bin/ && chmod +x ~/bin/winrdp-session-ctl
+# Then edit DEFAULT_ROOT below to the path of your clone (or set $WINRDP_SESSION_CTL_ROOT).
+# ~/bin must be on your PATH.
+#
+# Unlike a "cd into the repo" wrapper, this keeps your current directory, so relative
+# paths such as `winrdp-session-ctl screenshot shot.png` land where you are.
 set -euo pipefail
-DEFAULT_ROOT="/Users/boris/work/winrdp-session-ctl"
-ROOT="${WINRDP_SESSION_CTL_ROOT:-$DEFAULT_ROOT}"
+
+DEFAULT_ROOT="/Users/boris/work/winrdp-session-ctl"   # <-- EDIT: path to your clone of the repo
+
+resolve_root() {
+  if [[ -n "${WINRDP_SESSION_CTL_ROOT:-}" ]]; then
+    printf '%s\n' "$WINRDP_SESSION_CTL_ROOT"; return
+  fi
+  # If this file is a symlink into the repo (ln -s .../doc/winrdp-session-ctl ~/bin/), use that repo.
+  local source="${BASH_SOURCE[0]}"
+  if [[ -L "$source" ]]; then
+    local target; target="$(readlink "$source")"
+    [[ "$target" != /* ]] && target="$(dirname "$source")/$target"
+    local dir; dir="$(cd "$(dirname "$target")" && pwd)"
+    if [[ -f "$dir/../cli/cli.mjs" ]]; then (cd "$dir/.." && pwd); return; fi
+  fi
+  printf '%s\n' "$DEFAULT_ROOT"
+}
+
+ROOT="$(resolve_root)"
+if [[ ! -f "$ROOT/cli/cli.mjs" ]]; then
+  printf 'winrdp-session-ctl: repo not found at %s (edit DEFAULT_ROOT in %s)\n' "$ROOT" "${BASH_SOURCE[0]}" >&2
+  exit 1
+fi
+if ! command -v node >/dev/null 2>&1; then
+  printf 'winrdp-session-ctl: node (18+) is required but not on PATH\n' >&2
+  exit 1
+fi
+
 exec node "$ROOT/cli/cli.mjs" "$@"
