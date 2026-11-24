@@ -1,6 +1,6 @@
 # rdp-session-ctl agent. Runs INSIDE the interactive desktop session (started by a scheduled task with /IT),
 # serves JSON commands on 127.0.0.1:$Port. Reach it from the Mac through an SSH tunnel; never expose it.
-param([int]$Port=8766,[string]$Dir=(Join-Path $env:USERPROFILE 'Downloads\winrdp-session-ctl'))
+param([int]$Port=8766,[string]$Dir=(Join-Path $env:USERPROFILE 'Downloads\windows-session-ctl'))
 $ErrorActionPreference='Stop'
 $Version=5
 New-Item -ItemType Directory -Force $Dir | Out-Null
@@ -73,7 +73,7 @@ $M=@{
               $si=New-Object Diagnostics.ProcessStartInfo; $si.UseShellExecute=$false; $si.CreateNoWindow=$true
               $si.RedirectStandardOutput=$true; $si.RedirectStandardError=$true; $si.StandardOutputEncoding=$utf8; $si.StandardErrorEncoding=$utf8
               if($p.shell -eq 'cmd'){ # run as a batch file so multi-line scripts work; UTF-8 console
-                $tmp=Join-Path $env:TEMP ("winrdp-"+[guid]::NewGuid().ToString('N')+".cmd")
+                $tmp=Join-Path $env:TEMP ("windows-"+[guid]::NewGuid().ToString('N')+".cmd")
                 [IO.File]::WriteAllText($tmp,"@echo off`r`nchcp 65001 >nul`r`n"+(([string]$p.command) -replace "`r?`n","`r`n")+"`r`n",$utf8)
                 $si.FileName=$env:ComSpec; $si.Arguments="/d /c `"`"$tmp`"`"" }
               else { $enc=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes('$ProgressPreference=''SilentlyContinue''; [Console]::OutputEncoding=[Text.Encoding]::UTF8; '+[string]$p.command))

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// winrdp-session-ctl: drive the Windows desktop session you are logged into over RDP.
+// windows-session-ctl: drive the Windows desktop session a user is logged into (RDP or console), over SSH.
 //   Mac CLI --HTTP--> ssh tunnel (127.0.0.1:LOCAL) --> agent.ps1 inside the RDP session --> UI Automation / SendInput
 import { spawnSync, spawn } from "node:child_process";
 import net from "node:net";
@@ -9,52 +9,52 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
-const CFG_DIR = join(homedir(), ".config", "winrdp-session-ctl");
+const CFG_DIR = join(homedir(), ".config", "windows-session-ctl");
 const CFG_FILE = join(CFG_DIR, "config.json");
 const TOKEN_FILE = join(CFG_DIR, "token");
 const AGENT_PORT = 8766;
-const rdir = (t) => `C:\\Users\\${t.user}\\Downloads\\winrdp-session-ctl`; // install dir on the VM
+const rdir = (t) => `C:\\Users\\${t.user}\\Downloads\\windows-session-ctl`; // install dir on the VM
 const AGENT_VERSION = 5; // keep in step with $Version in agent/agent.ps1
 
 const USAGE = `Drive the Windows desktop session you are logged into over RDP.
 
-  winrdp-session-ctl config [host|user|key|port <value>]   show / set the target VM
-  winrdp-session-ctl install            copy the agent to the VM, register it to start at logon, start it
-  winrdp-session-ctl up | down          open / close the SSH tunnel (other commands open it on demand)
-  winrdp-session-ctl status             tunnel, agent, session, screen size
+  windows-session-ctl config [host|user|key|port <value>]   show / set the target VM
+  windows-session-ctl install            copy the agent to the VM, register it to start at logon, start it
+  windows-session-ctl up | down          open / close the SSH tunnel (other commands open it on demand)
+  windows-session-ctl status             tunnel, agent, session, screen size
 
-  winrdp-session-ctl windows                       visible top-level windows (name, class, pid, rect)
-  winrdp-session-ctl tree <window> [depth]         controls inside a window (UI Automation tree, JSON)
-  winrdp-session-ctl find <window> <text>          controls whose name / automation id contains text
-  winrdp-session-ctl focus <window>
-  winrdp-session-ctl click <window> <name|id>      Invoke/Toggle/Select by name, no coordinates needed
-  winrdp-session-ctl settext <window> <text> [--control <name|id>]   set an edit box / document (default: first one)
-  winrdp-session-ctl gettext <window> [--control <name|id>]
-  winrdp-session-ctl type <text> [--window <w>]    keystrokes to the focused window
-  winrdp-session-ctl key <keys> [--window <w>]     SendKeys syntax: ^c  %{F4}  {ENTER}  ^{ESC}
-  winrdp-session-ctl mouse <move|click|dblclick|rclick> <x> <y>
-  winrdp-session-ctl mouse drag <x1> <y1> <x2> <y2>
-  winrdp-session-ctl mouse scroll <delta>          120 = one notch up, -120 = down
-  winrdp-session-ctl screenshot [path] [--window <w>]
-  winrdp-session-ctl launch <exe> [args]           start a program in the session, do not wait
-  winrdp-session-ctl exec <cmd-command> [--timeout s]  run a CMD command/batch script in the session (arg, or stdin when piped), wait, print stdout; exit code passed through
-  winrdp-session-ctl psexec <powershell> [--timeout s]  same, for PowerShell
-  winrdp-session-ctl raw <method> [json-params]
+  windows-session-ctl windows                       visible top-level windows (name, class, pid, rect)
+  windows-session-ctl tree <window> [depth]         controls inside a window (UI Automation tree, JSON)
+  windows-session-ctl find <window> <text>          controls whose name / automation id contains text
+  windows-session-ctl focus <window>
+  windows-session-ctl click <window> <name|id>      Invoke/Toggle/Select by name, no coordinates needed
+  windows-session-ctl settext <window> <text> [--control <name|id>]   set an edit box / document (default: first one)
+  windows-session-ctl gettext <window> [--control <name|id>]
+  windows-session-ctl type <text> [--window <w>]    keystrokes to the focused window
+  windows-session-ctl key <keys> [--window <w>]     SendKeys syntax: ^c  %{F4}  {ENTER}  ^{ESC}
+  windows-session-ctl mouse <move|click|dblclick|rclick> <x> <y>
+  windows-session-ctl mouse drag <x1> <y1> <x2> <y2>
+  windows-session-ctl mouse scroll <delta>          120 = one notch up, -120 = down
+  windows-session-ctl screenshot [path] [--window <w>]
+  windows-session-ctl launch <exe> [args]           start a program in the session, do not wait
+  windows-session-ctl exec <cmd-command> [--timeout s]  run a CMD command/batch script in the session (arg, or stdin when piped), wait, print stdout; exit code passed through
+  windows-session-ctl psexec <powershell> [--timeout s]  same, for PowerShell
+  windows-session-ctl raw <method> [json-params]
 
 Window names match exactly first, then by substring. Coordinates are screen pixels as in screenshots.
-Target: WINRDP_HOST / WINRDP_USER / WINRDP_KEY env vars, or \`config\`. Prefer \`tree\`/\`find\`/\`click\` over screenshots.`;
+Target: WINSESSION_HOST / WINSESSION_USER / WINSESSION_KEY env vars, or \`config\`. Prefer \`tree\`/\`find\`/\`click\` over screenshots.`;
 
 const die = (m) => { console.error(m); process.exit(1); };
 const loadCfg = () => (existsSync(CFG_FILE) ? JSON.parse(readFileSync(CFG_FILE, "utf8")) : {});
 function target() {
   const c = loadCfg();
   const t = {
-    host: process.env.WINRDP_HOST || c.host,
-    user: process.env.WINRDP_USER || c.user || "azureuser",
-    key: process.env.WINRDP_KEY || c.key || join(homedir(), ".ssh", "id_ed25519"),
-    port: Number(process.env.WINRDP_PORT || c.port || AGENT_PORT),
+    host: process.env.WINSESSION_HOST || c.host,
+    user: process.env.WINSESSION_USER || c.user || "azureuser",
+    key: process.env.WINSESSION_KEY || c.key || join(homedir(), ".ssh", "id_ed25519"),
+    port: Number(process.env.WINSESSION_PORT || c.port || AGENT_PORT),
   };
-  if (!t.host) die("No host. Run: winrdp-session-ctl config host <dns-name-or-ip>");
+  if (!t.host) die("No host. Run: windows-session-ctl config host <dns-name-or-ip>");
   return t;
 }
 const sshBase = (t) => ["-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-i", t.key];
@@ -81,20 +81,20 @@ async function up(t) {
 }
 function fetchToken(t) {
   const r = ssh(t, `type "${rdir(t)}\\token"`);
-  if (r.code !== 0 || !r.out) die("Agent token not found; run: winrdp-session-ctl install  (and be logged in over RDP)");
+  if (r.code !== 0 || !r.out) die("Agent token not found; run: windows-session-ctl install  (and be logged in over RDP)");
   mkdirSync(CFG_DIR, { recursive: true }); writeFileSync(TOKEN_FILE, r.out, { mode: 0o600 }); return r.out;
 }
 
 async function installAgent(t) {
   console.error("Installing agent on the VM...");
   ssh(t, `if not exist "${rdir(t)}" mkdir "${rdir(t)}"`);
-  ssh(t, "schtasks /End /TN winrdp-agent");
+  ssh(t, "schtasks /End /TN windows-agent");
   const sc = spawnSync("scp", ["-q", "-i", t.key, join(ROOT, "agent", "agent.ps1"), `${t.user}@${t.host}:${rdir(t).replace(/\\/g, "/")}/agent.ps1`], { encoding: "utf8" });
   if (sc.status !== 0) die("scp failed: " + sc.stderr);
-  const mk = ssh(t, `schtasks /Create /TN winrdp-agent /F /SC ONLOGON /RU ${t.user} /IT /RL HIGHEST /TR "powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \\"${rdir(t)}\\agent.ps1\\""`);
+  const mk = ssh(t, `schtasks /Create /TN windows-agent /F /SC ONLOGON /RU ${t.user} /IT /RL HIGHEST /TR "powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \\"${rdir(t)}\\agent.ps1\\""`);
   if (mk.code !== 0) die("schtasks create failed: " + (mk.out || mk.err));
   ssh(t, `del "${rdir(t)}\\agent.log"`);
-  const run = ssh(t, "schtasks /Run /TN winrdp-agent");
+  const run = ssh(t, "schtasks /Run /TN windows-agent");
   if (run.code !== 0) die("schtasks run failed: " + (run.out || run.err));
   for (let i = 0; i < 20; i++) {
     await new Promise((r) => setTimeout(r, 1000));
@@ -128,7 +128,7 @@ async function rpc(method, params = {}) {
 async function runShell(shell) {
   let command = a.join(" ");
   if (a.length === 0 || command === "-") { // no argument (or "-"): read the script from stdin
-    if (process.stdin.isTTY) die(`${cmd}: give a command, or pipe one in (echo 'dir' | winrdp-session-ctl ${cmd})`);
+    if (process.stdin.isTTY) die(`${cmd}: give a command, or pipe one in (echo 'dir' | windows-session-ctl ${cmd})`);
     command = readFileSync(0, "utf8");
   }
   if (!command.trim()) die(`${cmd}: empty command`);
@@ -178,7 +178,7 @@ switch (cmd) {
   case "psexec": await runShell("powershell"); break;
   case "launch": print(await rpc("launch", { path: a[0], args: a.slice(1).join(" ") })); break;
   case "screenshot": {
-    const out = a[0] || "winrdp-screenshot.png"; const r = await rpc("screenshot", { window: flags.window });
+    const out = a[0] || "windows-screenshot.png"; const r = await rpc("screenshot", { window: flags.window });
     writeFileSync(out, Buffer.from(r.png, "base64")); print({ saved: out, w: r.w, h: r.h, x: r.x, y: r.y }); break;
   }
   case "raw": print(await rpc(a[0], a[1] ? JSON.parse(a[1]) : {})); break;

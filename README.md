@@ -1,6 +1,6 @@
-# winrdp-session-ctl
+# windows-session-ctl
 
-Drive the Windows desktop session you are already logged into over RDP, from the shell: list windows, inspect the
+Drive the Windows desktop session you are already logged into (over RDP or at the console), from the shell: list windows, inspect the
 controls inside them, click, type, run commands, take screenshots. It is the Windows-desktop counterpart of
 [browser-session-ctl](../browser-session-ctl): a CLI that an AI coding agent (Claude Code, Cursor, …) or you can run to
 operate a real, already-open session instead of starting a fresh, empty one.
@@ -28,7 +28,7 @@ you / agent --> CLI (Mac) --HTTP--> SSH tunnel --> agent.ps1 (inside your RDP se
 ## Quick start
 
 ```bash
-cd ~/work/winrdp-session-ctl
+cd ~/work/windows-session-ctl
 node cli/cli.mjs config host entelecheia-win11-test.eastus.cloudapp.azure.com
 node cli/cli.mjs config key ~/.ssh/azure_test_vm
 # user defaults to azureuser; set it with: config user <name>
@@ -45,8 +45,8 @@ node cli/cli.mjs exec 'ver'
 Optional global command (works from any directory, like `browser-session-ctl`):
 
 ```bash
-cp doc/winrdp-session-ctl ~/bin/ && chmod +x ~/bin/winrdp-session-ctl   # edit DEFAULT_ROOT if you moved the repo
-winrdp-session-ctl windows
+cp doc/windows-session-ctl ~/bin/ && chmod +x ~/bin/windows-session-ctl   # edit DEFAULT_ROOT if you moved the repo
+windows-session-ctl windows
 ```
 
 ## How it works
@@ -62,7 +62,7 @@ winrdp-session-ctl windows
    Mac then forwards, encrypted, to the agent on the VM. The agent only listens on the VM's loopback address and the NSG
    has no rule for 8766, so SSH is the only way in. The tunnel stays up between commands; `down` closes it.
 4. **Auth.** The agent generates a random token at each start and writes it to `token` next to the script (file ACL:
-   the VM user and SYSTEM only). The CLI reads it over SSH, caches it in `~/.config/winrdp-session-ctl/token` (mode
+   the VM user and SYSTEM only). The CLI reads it over SSH, caches it in `~/.config/windows-session-ctl/token` (mode
    0600), and sends it as the `X-Token` header. If the agent restarts, the 401 triggers a token refetch automatically.
 
 ### Automatic install and update
@@ -77,7 +77,7 @@ When you change `agent/agent.ps1`, bump `$Version` there and `AGENT_VERSION` in 
 
 ### What lives on the VM
 
-In `C:\Users\<user>\Downloads\winrdp-session-ctl\`:
+In `C:\Users\<user>\Downloads\windows-session-ctl\`:
 
 | File | Purpose |
 |---|---|
@@ -85,8 +85,8 @@ In `C:\Users\<user>\Downloads\winrdp-session-ctl\`:
 | `token` | per-start auth token (restricted ACL) |
 | `agent.log` | one line, written once the agent is listening |
 
-plus a scheduled task named `winrdp-agent` (on logon, interactive, highest privileges). To remove everything:
-`schtasks /Delete /TN winrdp-agent /F` and delete the folder.
+plus a scheduled task named `windows-agent` (on logon, interactive, highest privileges). To remove everything:
+`schtasks /Delete /TN windows-agent /F` and delete the folder.
 
 ## Command reference
 
@@ -97,7 +97,7 @@ Run `node cli/cli.mjs` with no arguments (or `help`) for the built-in usage text
 | Command | What it does |
 |---|---|
 | `config` | Print the stored config. |
-| `config host\|user\|key\|port <value>` | Set the SSH target (stored in `~/.config/winrdp-session-ctl/config.json`). |
+| `config host\|user\|key\|port <value>` | Set the SSH target (stored in `~/.config/windows-session-ctl/config.json`). |
 | `install` | Copy the agent to the VM, register the logon task, (re)start it. Normally implicit. |
 | `up` / `down` | Open / close the SSH tunnel. Other commands open it on demand. |
 | `status` | `{host, tunnel, agent, version, session, screen, user}`. Does **not** bootstrap the agent; it only reports. |
@@ -111,7 +111,7 @@ Run `node cli/cli.mjs` with no arguments (or `help`) for the built-in usage text
 | `tree <window> [depth]` | The control tree of a window (default depth 8, at most 800 nodes). Each node has `type`, `name`, optional `id` (AutomationId), `rect`, and `disabled`. |
 | `find <window> <text>` | Flat list of controls whose name **or** AutomationId contains `text` (case-insensitive). |
 | `gettext <window> [--control c]` | The text of a control (printed as plain text: Value pattern, else Text pattern, else its name). |
-| `screenshot [path] [--window w]` | PNG of the whole virtual screen, or cropped to a window. Returns `{saved, w, h, x, y}`; `x`,`y` is the capture origin in screen coordinates. Default path `winrdp-screenshot.png`. |
+| `screenshot [path] [--window w]` | PNG of the whole virtual screen, or cropped to a window. Returns `{saved, w, h, x, y}`; `x`,`y` is the capture origin in screen coordinates. Default path `windows-screenshot.png`. |
 
 ### Acting on controls (no coordinates)
 
@@ -134,28 +134,28 @@ Examples:
 
 ```bash
 # install an MSIX/APPX package and get a real exit code and error text
-winrdp-session-ctl psexec 'Add-AppxPackage -Path C:\Users\azureuser\Downloads\app.msix' --timeout 300
+windows-session-ctl psexec 'Add-AppxPackage -Path C:\Users\azureuser\Downloads\app.msix' --timeout 300
 # install a debug package (sideload with a registered manifest)
-winrdp-session-ctl psexec 'Add-AppxPackage -Register C:\build\AppxManifest.xml'
+windows-session-ctl psexec 'Add-AppxPackage -Register C:\build\AppxManifest.xml'
 # see what is installed
-winrdp-session-ctl psexec 'Get-AppxPackage *crosspass* | Select Name,Version'
+windows-session-ctl psexec 'Get-AppxPackage *crosspass* | Select Name,Version'
 # multi-line script from a pipe or heredoc (no quoting trouble)
-winrdp-session-ctl psexec <<'EOF'
+windows-session-ctl psexec <<'EOF'
 $p = Get-AppxPackage *crosspass*
 if ($p) { Remove-AppxPackage $p }
 Add-AppxPackage -Path C:\Users\azureuser\Downloads\app.msix
 EOF
-cat install.ps1 | winrdp-session-ctl psexec --timeout 600
+cat install.ps1 | windows-session-ctl psexec --timeout 600
 # CMD: plain commands and batch scripts
-winrdp-session-ctl exec 'dir C:\Users\azureuser\Downloads /b'
-winrdp-session-ctl exec <<'EOF'
+windows-session-ctl exec 'dir C:\Users\azureuser\Downloads /b'
+windows-session-ctl exec <<'EOF'
 set X=hello
 echo X is %X%
 exit /b 4
 EOF
 # open the package with App Installer instead, then drive its window by name
-winrdp-session-ctl launch C:\Users\azureuser\Downloads\app.msix
-winrdp-session-ctl click "App Installer" Install
+windows-session-ctl launch C:\Users\azureuser\Downloads\app.msix
+windows-session-ctl click "App Installer" Install
 ```
 
 `psexec` runs a separate `powershell.exe` (`-NoProfile`, command sent as `-EncodedCommand`, so quotes and special characters
@@ -199,13 +199,13 @@ name or `id` in `tree`, fall back to `mouse click` using the `rect` from `tree` 
 
 | Setting | Env var | Config key | Default |
 |---|---|---|---|
-| VM host | `WINRDP_HOST` | `host` | none (required) |
-| SSH user | `WINRDP_USER` | `user` | `azureuser` |
-| SSH key | `WINRDP_KEY` | `key` | `~/.ssh/id_ed25519` |
-| Local tunnel port | `WINRDP_PORT` | `port` | `8766` |
+| VM host | `WINSESSION_HOST` | `host` | none (required) |
+| SSH user | `WINSESSION_USER` | `user` | `azureuser` |
+| SSH key | `WINSESSION_KEY` | `key` | `~/.ssh/id_ed25519` |
+| Local tunnel port | `WINSESSION_PORT` | `port` | `8766` |
 
 Environment variables override the config file. The remote agent port is fixed at 8766. The tool targets one VM at a
-time. To switch, give the second VM its own `WINRDP_PORT` (a tunnel on the same local port belongs to the previous host),
+time. To switch, give the second VM its own `WINSESSION_PORT` (a tunnel on the same local port belongs to the previous host),
 or run `down` first.
 
 ## Security
@@ -239,5 +239,5 @@ or a small `depth` instead of dumping everything.
 ```
 agent/agent.ps1          the in-session agent (UIA, SendInput, exec/psexec, screenshots, HTTP server)
 cli/cli.mjs              the CLI (tunnel, auto-install, commands)
-doc/winrdp-session-ctl   example global wrapper for ~/bin
+doc/windows-session-ctl   example global wrapper for ~/bin
 ```

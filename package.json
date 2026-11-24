@@ -1,10 +1,10 @@
 {
-  "name": "winrdp-session-ctl",
+  "name": "windows-session-ctl",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Drive a Windows desktop session (the one you are logged into over RDP) from the shell",
-  "bin": { "winrdp-session-ctl": "./cli/cli.mjs" },
+  "description": "Drive a Windows desktop session (the one you are logged into, over RDP or at the console) from the shell",
+  "bin": { "windows-session-ctl": "./cli/cli.mjs" },
   "scripts": { "ctl": "node cli/cli.mjs" },
   "engines": { "node": ">=18" }
 }
