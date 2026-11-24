@@ -14,7 +14,7 @@ const CFG_FILE = join(CFG_DIR, "config.json");
 const TOKEN_FILE = join(CFG_DIR, "token");
 const AGENT_PORT = 8766;
 const rdir = (t) => `C:\\Users\\${t.user}\\Downloads\\winrdp-session-ctl`; // install dir on the VM
-const AGENT_VERSION = 2; // keep in step with $Version in agent/agent.ps1
+const AGENT_VERSION = 5; // keep in step with $Version in agent/agent.ps1
 
 const USAGE = `Drive the Windows desktop session you are logged into over RDP.
 
@@ -36,7 +36,9 @@ const USAGE = `Drive the Windows desktop session you are logged into over RDP.
   winrdp-session-ctl mouse drag <x1> <y1> <x2> <y2>
   winrdp-session-ctl mouse scroll <delta>          120 = one notch up, -120 = down
   winrdp-session-ctl screenshot [path] [--window <w>]
-  winrdp-session-ctl launch <exe> [args]
+  winrdp-session-ctl launch <exe> [args]           start a program in the session, do not wait
+  winrdp-session-ctl exec <cmd-command> [--timeout s]  run a CMD command/batch script in the session (arg, or stdin when piped), wait, print stdout; exit code passed through
+  winrdp-session-ctl psexec <powershell> [--timeout s]  same, for PowerShell
   winrdp-session-ctl raw <method> [json-params]
 
 Window names match exactly first, then by substring. Coordinates are screen pixels as in screenshots.
@@ -123,13 +125,26 @@ async function rpc(method, params = {}) {
   if (!r.body.ok) die(`error: ${r.body.error}`);
   return r.body.result;
 }
+async function runShell(shell) {
+  let command = a.join(" ");
+  if (a.length === 0 || command === "-") { // no argument (or "-"): read the script from stdin
+    if (process.stdin.isTTY) die(`${cmd}: give a command, or pipe one in (echo 'dir' | winrdp-session-ctl ${cmd})`);
+    command = readFileSync(0, "utf8");
+  }
+  if (!command.trim()) die(`${cmd}: empty command`);
+  const r = await rpc("exec", { command, shell, timeout: flags.timeout });
+  if (r.stdout) process.stdout.write(r.stdout);
+  if (r.stderr) process.stderr.write(r.stderr);
+  if (r.timedOut) console.error(`${cmd}: timed out (process killed)`);
+  process.exit(r.timedOut ? 124 : r.exitCode);
+}
 const print = (v) => console.log(typeof v === "string" ? v : JSON.stringify(v, null, 2));
 
 // ---- args ----
 const argv = process.argv.slice(2);
 const flags = {}; const pos = [];
 for (let i = 0; i < argv.length; i++) {
-  if (argv[i] === "--window" || argv[i] === "--control") flags[argv[i].slice(2)] = argv[++i];
+  if (argv[i] === "--window" || argv[i] === "--control" || argv[i] === "--timeout") flags[argv[i].slice(2)] = argv[++i];
   else pos.push(argv[i]);
 }
 const [cmd, ...a] = pos;
@@ -159,6 +174,8 @@ switch (cmd) {
     const [action, ...n] = a; const v = n.map(Number);
     print(await rpc("mouse", action === "scroll" ? { action, delta: v[0] } : { action, x: v[0], y: v[1], x2: v[2], y2: v[3] })); break;
   }
+  case "exec": await runShell("cmd"); break;
+  case "psexec": await runShell("powershell"); break;
   case "launch": print(await rpc("launch", { path: a[0], args: a.slice(1).join(" ") })); break;
   case "screenshot": {
     const out = a[0] || "winrdp-screenshot.png"; const r = await rpc("screenshot", { window: flags.window });

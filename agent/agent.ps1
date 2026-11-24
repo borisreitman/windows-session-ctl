@@ -2,7 +2,7 @@
 # serves JSON commands on 127.0.0.1:$Port. Reach it from the Mac through an SSH tunnel; never expose it.
 param([int]$Port=8766,[string]$Dir=(Join-Path $env:USERPROFILE 'Downloads\winrdp-session-ctl'))
 $ErrorActionPreference='Stop'
-$Version=2
+$Version=5
 New-Item -ItemType Directory -Force $Dir | Out-Null
 Add-Type -AssemblyName System.Windows.Forms,System.Drawing,UIAutomationClient,UIAutomationTypes
 Add-Type @'
@@ -69,6 +69,19 @@ $M=@{
                 'scroll'{[W]::mouse_event(0x800,0,0,[int]$p.delta,[UIntPtr]::Zero)} default{throw "bad mouse action"} }; @{ok=$true} }
  type       = { param($p) if($p.window){Raise (Win $p.window); Start-Sleep -m 250}; [Windows.Forms.SendKeys]::SendWait((Esc $p.text)); @{ok=$true} }
  key        = { param($p) if($p.window){Raise (Win $p.window); Start-Sleep -m 250}; [Windows.Forms.SendKeys]::SendWait($p.keys); @{ok=$true} }
+ exec       = { param($p) $ms=if($p.timeout){[int]$p.timeout*1000}else{120000}; $utf8=New-Object Text.UTF8Encoding($false); $tmp=$null
+              $si=New-Object Diagnostics.ProcessStartInfo; $si.UseShellExecute=$false; $si.CreateNoWindow=$true
+              $si.RedirectStandardOutput=$true; $si.RedirectStandardError=$true; $si.StandardOutputEncoding=$utf8; $si.StandardErrorEncoding=$utf8
+              if($p.shell -eq 'cmd'){ # run as a batch file so multi-line scripts work; UTF-8 console
+                $tmp=Join-Path $env:TEMP ("winrdp-"+[guid]::NewGuid().ToString('N')+".cmd")
+                [IO.File]::WriteAllText($tmp,"@echo off`r`nchcp 65001 >nul`r`n"+(([string]$p.command) -replace "`r?`n","`r`n")+"`r`n",$utf8)
+                $si.FileName=$env:ComSpec; $si.Arguments="/d /c `"`"$tmp`"`"" }
+              else { $enc=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes('$ProgressPreference=''SilentlyContinue''; [Console]::OutputEncoding=[Text.Encoding]::UTF8; '+[string]$p.command))
+                $si.FileName='powershell.exe'; $si.Arguments="-NoProfile -ExecutionPolicy Bypass -EncodedCommand $enc" }
+              try { $pr=[Diagnostics.Process]::Start($si); $o=$pr.StandardOutput.ReadToEndAsync(); $e=$pr.StandardError.ReadToEndAsync()
+                if(-not $pr.WaitForExit($ms)){ try{$pr.Kill()}catch{}; @{timedOut=$true;exitCode=-1;stdout=$o.Result;stderr=$e.Result} }
+                else { $pr.WaitForExit(); @{timedOut=$false;exitCode=$pr.ExitCode;stdout=$o.Result;stderr=$e.Result} } }
+              finally { if($tmp){ Remove-Item $tmp -ErrorAction SilentlyContinue } } }
  launch     = { param($p) Start-Process -FilePath $p.path -ArgumentList $p.args; @{ok=$true} }
  screenshot = { param($p) $b=[System.Windows.Forms.SystemInformation]::VirtualScreen; $x=$b.Left;$y=$b.Top;$w=$b.Width;$h=$b.Height
               if($p.window){ $r=(Win $p.window).Current.BoundingRectangle; $x=[Math]::Max($b.Left,[int]$r.X);$y=[Math]::Max($b.Top,[int]$r.Y);$w=[int]$r.Width;$h=[int]$r.Height }
