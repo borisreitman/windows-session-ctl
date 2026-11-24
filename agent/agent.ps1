@@ -1,6 +1,6 @@
 # rdp-session-ctl agent. Runs INSIDE the interactive desktop session (started by a scheduled task with /IT),
 # serves JSON commands on 127.0.0.1:$Port. Reach it from the Mac through an SSH tunnel; never expose it.
-param([int]$Port=8766,[string]$Dir='C:\uiauto')
+param([int]$Port=8766,[string]$Dir=(Join-Path $env:USERPROFILE 'Downloads\winrdp-session-ctl'))
 $ErrorActionPreference='Stop'
 $Version=2
 New-Item -ItemType Directory -Force $Dir | Out-Null

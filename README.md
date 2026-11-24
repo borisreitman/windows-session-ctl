@@ -9,7 +9,7 @@ you / agent --> CLI (Mac) --HTTP--> ssh tunnel --> agent.ps1 (inside the RDP ses
 
 The agent has to run **inside the interactive session**: an SSH shell lives in session 0, which has no desktop. A scheduled
 task registered with `/IT` starts it in the session of the logged-in user. It listens on `127.0.0.1:8766` only, requires a
-token (stored in `C:\uiauto\token`, ACL'd to the user), and is reached through an SSH tunnel the CLI opens on demand.
+token (stored in `%USERPROFILE%\Downloads\winrdp-session-ctl\token`, ACL'd to the user), and is reached through an SSH tunnel the CLI opens on demand.
 
 Prefer **structure over pixels**: `windows`, `tree`, `find`, `click <window> <name>`, `settext`, `gettext` use Windows UI
 Automation (no coordinates, no screenshots). Use `mouse`, `type`, `key`, `screenshot` for apps UIA cannot see.

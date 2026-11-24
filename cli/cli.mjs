@@ -13,6 +13,7 @@ const CFG_DIR = join(homedir(), ".config", "winrdp-session-ctl");
 const CFG_FILE = join(CFG_DIR, "config.json");
 const TOKEN_FILE = join(CFG_DIR, "token");
 const AGENT_PORT = 8766;
+const rdir = (t) => `C:\\Users\\${t.user}\\Downloads\\winrdp-session-ctl`; // install dir on the VM
 const AGENT_VERSION = 2; // keep in step with $Version in agent/agent.ps1
 
 const USAGE = `Drive the Windows desktop session you are logged into over RDP.
@@ -77,25 +78,25 @@ async function up(t) {
   die("Could not open the SSH tunnel.");
 }
 function fetchToken(t) {
-  const r = ssh(t, "type C:\\uiauto\\token");
+  const r = ssh(t, `type "${rdir(t)}\\token"`);
   if (r.code !== 0 || !r.out) die("Agent token not found; run: winrdp-session-ctl install  (and be logged in over RDP)");
   mkdirSync(CFG_DIR, { recursive: true }); writeFileSync(TOKEN_FILE, r.out, { mode: 0o600 }); return r.out;
 }
 
 async function installAgent(t) {
   console.error("Installing agent on the VM...");
-  ssh(t, "if not exist C:\\uiauto mkdir C:\\uiauto");
+  ssh(t, `if not exist "${rdir(t)}" mkdir "${rdir(t)}"`);
   ssh(t, "schtasks /End /TN winrdp-agent");
-  const sc = spawnSync("scp", ["-q", "-i", t.key, join(ROOT, "agent", "agent.ps1"), `${t.user}@${t.host}:C:/uiauto/agent.ps1`], { encoding: "utf8" });
+  const sc = spawnSync("scp", ["-q", "-i", t.key, join(ROOT, "agent", "agent.ps1"), `${t.user}@${t.host}:${rdir(t).replace(/\\/g, "/")}/agent.ps1`], { encoding: "utf8" });
   if (sc.status !== 0) die("scp failed: " + sc.stderr);
-  const mk = ssh(t, `schtasks /Create /TN winrdp-agent /F /SC ONLOGON /RU ${t.user} /IT /RL HIGHEST /TR "powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File C:\\uiauto\\agent.ps1"`);
+  const mk = ssh(t, `schtasks /Create /TN winrdp-agent /F /SC ONLOGON /RU ${t.user} /IT /RL HIGHEST /TR "powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \\"${rdir(t)}\\agent.ps1\\""`);
   if (mk.code !== 0) die("schtasks create failed: " + (mk.out || mk.err));
-  ssh(t, "del C:\\uiauto\\agent.log");
+  ssh(t, `del "${rdir(t)}\\agent.log"`);
   const run = ssh(t, "schtasks /Run /TN winrdp-agent");
   if (run.code !== 0) die("schtasks run failed: " + (run.out || run.err));
   for (let i = 0; i < 20; i++) {
     await new Promise((r) => setTimeout(r, 1000));
-    const l = ssh(t, "type C:\\uiauto\\agent.log");
+    const l = ssh(t, `type "${rdir(t)}\\agent.log"`);
     if (l.out.includes("listening")) { fetchToken(t); console.error(l.out); return; }
   }
   die("Agent did not start. Is anyone logged in over RDP on the VM?");
@@ -105,7 +106,7 @@ async function tryCall(t, method, params) {
   let tok = existsSync(TOKEN_FILE) ? readFileSync(TOKEN_FILE, "utf8") : "";
   let r = tok ? await call(t, method, params, tok).catch(() => null) : null;
   if (!r || r.status === 401) { // stale token or agent restarted: re-read it from the VM
-    const f = ssh(t, "type C:\\uiauto\\token");
+    const f = ssh(t, `type "${rdir(t)}\\token"`);
     if (f.code === 0 && f.out) { mkdirSync(CFG_DIR, { recursive: true }); writeFileSync(TOKEN_FILE, f.out, { mode: 0o600 }); r = await call(t, method, params, f.out).catch(() => null); }
   }
   return r;
