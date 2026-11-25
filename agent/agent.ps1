@@ -2,7 +2,7 @@
 # serves JSON commands on 127.0.0.1:$Port. Reach it from the Mac through an SSH tunnel; never expose it.
 param([int]$Port=8766,[int]$TlsPort=0,[string]$Dir=(Join-Path $env:USERPROFILE 'Downloads\windows-session-ctl'))
 $ErrorActionPreference='Stop'
-$Version=8
+$Version=14
 New-Item -ItemType Directory -Force $Dir | Out-Null
 Add-Type -AssemblyName System.Windows.Forms,System.Drawing,UIAutomationClient,UIAutomationTypes
 Add-Type @'
@@ -16,6 +16,44 @@ public class W {
 }
 '@
 [W]::SetProcessDPIAware() | Out-Null
+# image search for 'check' (C# because comparing pixels in PowerShell is far too slow)
+Add-Type -ReferencedAssemblies System.Drawing @'
+using System; using System.Collections.Generic; using System.Drawing; using System.Drawing.Imaging; using System.Runtime.InteropServices;
+public static class Img {
+  public static int[] Pixels(Bitmap b){
+    BitmapData d=b.LockBits(new Rectangle(0,0,b.Width,b.Height),ImageLockMode.ReadOnly,PixelFormat.Format32bppArgb);
+    try { int[] p=new int[b.Width*b.Height]; Marshal.Copy(d.Scan0,p,0,p.Length); return p; } finally { b.UnlockBits(d); }
+  }
+  static int Diff(int a,int b,int shift){ return Math.Abs(((a>>shift)&255)-((b>>shift)&255)); }
+  // Every place {x,y,difference} where every opaque template pixel is within tol per colour channel. Places never
+  // overlap (of overlapping candidates the closest wins) and at most max are returned, top to bottom.
+  public static int[][] Find(int[] hay,int hw,int hh,int[] tpl,int tw,int th,int tol,int max){
+    List<int[]> hits=new List<int[]>();
+    if(tw>hw || th>hh) return hits.ToArray();
+    long r=0,g=0,b=0; int n=0;
+    foreach(int c in tpl){ if(((c>>24)&255)<128) continue; r+=(c>>16)&255; g+=(c>>8)&255; b+=c&255; n++; }
+    if(n==0) return hits.ToArray();
+    int mean=(int)(((r/n)<<16)|((g/n)<<8)|(b/n));
+    // compare the most unusual pixels first, so that a wrong position is rejected quickly
+    int[] key=new int[n], idx=new int[n]; int k=0;
+    for(int i=0;i<tpl.Length;i++){ int c=tpl[i]; if(((c>>24)&255)<128) continue; key[k]=-(Diff(c,mean,16)+Diff(c,mean,8)+Diff(c,mean,0)); idx[k]=i; k++; }
+    Array.Sort(key,idx);
+    int[] want=new int[n], off=new int[n];
+    for(k=0;k<n;k++){ want[k]=tpl[idx[k]]; off[k]=(idx[k]/tw)*hw+idx[k]%tw; }
+    for(int y=0;y<=hh-th;y++) for(int x=0;x<=hw-tw;x++){
+      int[] near=null; int overlaps=0;
+      foreach(int[] h in hits) if(Math.Abs(h[0]-x)<tw && Math.Abs(h[1]-y)<th){ near=h; overlaps++; }
+      if(overlaps>1 || (near!=null && near[2]==0) || (near==null && hits.Count>=max)) continue;
+      int at=y*hw+x; long sum=0, limit=near==null ? long.MaxValue : near[2];
+      for(k=0;k<n;k++){ int p=hay[at+off[k]], q=want[k], dr=Diff(p,q,16), dg=Diff(p,q,8), db=Diff(p,q,0);
+        if(dr>tol || dg>tol || db>tol) break; sum+=dr+dg+db; if(sum>=limit) break; }
+      if(k<n) continue;
+      if(near==null) hits.Add(new int[]{x,y,(int)sum}); else { near[0]=x; near[1]=y; near[2]=(int)sum; }
+    }
+    return hits.ToArray();
+  }
+}
+'@
 
 # --- auth token (file readable only by this user's profile dir via ACL inheritance of $Dir is not enough; restrict it) ---
 $token=[guid]::NewGuid().ToString('N')
@@ -50,6 +88,61 @@ function ScreenSig { $b=[System.Windows.Forms.SystemInformation]::VirtualScreen;
 function SetPtr($x,$y){ Goto $x $y; $script:Ptr=@{sig=(ScreenSig);x=[int]$x;y=[int]$y} }
 function GuardPtr($what){ if(-not $script:Ptr){ return }; $now=ScreenSig
   if($now -ne $script:Ptr.sig){ throw "screen-changed: the screen changed from $($script:Ptr.sig) to $now since the pointer was placed at ($($script:Ptr.x),$($script:Ptr.y)), so that position no longer points at the same thing. Re-check with screenshot/tree/find and move the pointer again before the $what." } }
+
+# --- wait criteria: is a text or an image on the screen, in a window, or in a control? ('check' looks once; the CLI repeats)
+$ImgDir=Join-Path $Dir 'images'; $script:Tpl=@{}; $MaxMatches=100
+function ImgFile($h){ if($h -notmatch '^[0-9a-f]{64}$'){ throw 'bad image hash' }; Join-Path $ImgDir "$h.img" }
+function Template($h){ if(-not $script:Tpl.ContainsKey($h)){ $b=New-Object Drawing.Bitmap (ImgFile $h)
+  try{ $script:Tpl[$h]=@{p=[Img]::Pixels($b);w=$b.Width;h=$b.Height} } finally{ $b.Dispose() } }; $script:Tpl[$h] }
+$g=[Drawing.Graphics]::FromHwnd([IntPtr]::Zero); $Scale=$g.DpiX/96; $g.Dispose()
+function OnScreen($a){ # the part of {x,y,w,h} that is on screen, in whole pixels; $null if none is
+  $c=[Drawing.Rectangle]::Intersect([Windows.Forms.SystemInformation]::VirtualScreen,(New-Object Drawing.Rectangle ([int]$a.x),([int]$a.y),([int]$a.w),([int]$a.h)))
+  if($c.Width -gt 0 -and $c.Height -gt 0){ @{x=$c.X;y=$c.Y;w=$c.Width;h=$c.Height} } }
+function TextRect($e,$text,$shown){ # where a text match shows: around the characters if the app says where they are,
+  $q=$null                          # else the control, or just a text-sized part of a tall one
+  if($e.TryGetCurrentPattern([Windows.Automation.TextPattern]::Pattern,[ref]$q)){ try{
+    $range=$q.DocumentRange.FindText($text,$false,$true)
+    if($range){ $boxes=@($range.GetBoundingRectangles()); if(-not $boxes.Count){ return $null } # scrolled out of view
+      $left=($boxes | % Left | Measure-Object -Minimum).Minimum; $top=($boxes | % Top | Measure-Object -Minimum).Minimum
+      $right=($boxes | % Right | Measure-Object -Maximum).Maximum; $bottom=($boxes | % Bottom | Measure-Object -Maximum).Maximum
+      $line=$boxes[0].Height # follows the font size
+      return (OnScreen @{x=$left-$line;y=$top-$line/2;w=$right-$left+2*$line;h=$bottom-$top+$line}) }
+    }catch{} } # some controls offer the pattern but cannot search it
+  $r=Rect $e; if(-not $r){ return $null }
+  if($r.h -gt 64*$Scale){ $r.w=[Math]::Min($r.w,[Math]::Max(160,8*[Math]::Min($shown.Length,100)+80)*$Scale); $r.h=48*$Scale } # its top left
+  OnScreen $r }
+function ElText($e){ $e.Current.Name; $q=$null # what an element shows: name, value, document text
+  if($e.TryGetCurrentPattern([Windows.Automation.ValuePattern]::Pattern,[ref]$q)){ $q.Current.Value }
+  if($e.TryGetCurrentPattern([Windows.Automation.TextPattern]::Pattern,[ref]$q)){ $q.DocumentRange.GetText(-1) } }
+function FindText($roots,$text){ # each on-screen element, in or under $roots, whose text contains $text (any case)
+  $found=@(); $seen=@{}
+  foreach($root in $roots){
+    try{ $els=@($root)+@($root.FindAll($Sc::Descendants,$All)) }catch{ continue }
+    foreach($e in $els){ if($found.Count -ge $MaxMatches){ break }
+      try{ if($e.Current.IsOffscreen){ continue }
+        foreach($s in (ElText $e)){ if($s -and $s.IndexOf($text,[StringComparison]::OrdinalIgnoreCase) -ge 0){
+          $r=TextRect $e $text $s
+          if($r){ $key="$($r.x),$($r.y),$($r.w),$($r.h)" # one entry per place
+            if(-not $seen.ContainsKey($key)){ $seen[$key]=$true; $found+=,@{type=(CT $e);name=$e.Current.Name;rect=$r} } }
+          break } } }catch{} } }
+  ,$found }
+function FindImage($el,$hash,$tol){
+  $v=[Windows.Forms.SystemInformation]::VirtualScreen; $area=$v
+  if($el){ $r=Rect $el; if(-not $r -or $el.Current.IsOffscreen){ return @{matches=@();reason='not on screen'} }
+    $area=[Drawing.Rectangle]::Intersect($v,(New-Object Drawing.Rectangle $r.x,$r.y,$r.w,$r.h)) }
+  $t=Template $hash
+  if($area.Width -lt $t.w -or $area.Height -lt $t.h){ return @{matches=@();reason="the image ($($t.w)x$($t.h)) is larger than the visible area ($($area.Width)x$($area.Height))"} }
+  $bmp=New-Object Drawing.Bitmap $area.Width,$area.Height
+  try{ $g=[Drawing.Graphics]::FromImage($bmp); try{ $g.CopyFromScreen($area.X,$area.Y,0,0,$bmp.Size) } finally{ $g.Dispose() }
+    $px=[Img]::Pixels($bmp) } finally{ $bmp.Dispose() }
+  $hits=@([Img]::Find($px,$area.Width,$area.Height,$t.p,$t.w,$t.h,[int]$tol,$MaxMatches) | % { @{rect=@{x=$area.X+$_[0];y=$area.Y+$_[1];w=$t.w;h=$t.h}} })
+  @{matches=$hits} }
+function TestCriterion($c,$tol){
+  try{ $el=$null; if($c.window){ $el=Win $c.window; if($c.control){ $el=FindEl $el $c.control } }
+    if($c.image){ return (FindImage $el $c.image $tol) }
+    $roots=if($el){ $el } else { $UIA::RootElement.FindAll($Sc::Children,$All) }
+    return @{matches=(FindText $roots ([string]$c.text))}
+  }catch{ return @{matches=@();reason="$($_.Exception.Message)"} } } # e.g. the window does not exist (yet)
 
 $M=@{
  ping       = { @{ok=$true;version=$Version} }
@@ -97,10 +190,22 @@ $M=@{
                 else { $pr.WaitForExit(); @{timedOut=$false;exitCode=$pr.ExitCode;stdout=$o.Result;stderr=$e.Result} } }
               finally { if($tmp){ Remove-Item $tmp -ErrorAction SilentlyContinue } } }
  launch     = { param($p) Start-Process -FilePath $p.path -ArgumentList $p.args; @{ok=$true} }
- screenshot = { param($p) $b=[System.Windows.Forms.SystemInformation]::VirtualScreen; $x=$b.Left;$y=$b.Top;$w=$b.Width;$h=$b.Height
-              if($p.window){ $r=(Win $p.window).Current.BoundingRectangle; $x=[Math]::Max($b.Left,[int]$r.X);$y=[Math]::Max($b.Top,[int]$r.Y);$w=[int]$r.Width;$h=[int]$r.Height }
-              $bmp=New-Object Drawing.Bitmap $w,$h; $g=[Drawing.Graphics]::FromImage($bmp); $g.CopyFromScreen($x,$y,0,0,$bmp.Size)
-              $ms=New-Object IO.MemoryStream; $bmp.Save($ms,[Drawing.Imaging.ImageFormat]::Png); @{png=[Convert]::ToBase64String($ms.ToArray());w=$w;h=$h;x=$x;y=$y} }
+ putimage   = { param($p) $f=ImgFile $p.hash; $b=[Convert]::FromBase64String($p.data)
+              $h=-join ([Security.Cryptography.SHA256]::Create().ComputeHash($b) | % { $_.ToString('x2') })
+              if($h -ne $p.hash){ throw 'image data does not match its hash' }
+              try{ (New-Object Drawing.Bitmap (New-Object IO.MemoryStream(,$b))).Dispose() }catch{ throw 'not a readable image (use PNG, BMP, GIF or JPEG)' }
+              New-Item -ItemType Directory -Force $ImgDir | Out-Null; [IO.File]::WriteAllBytes($f,$b); @{ok=$true} }
+ check      = { param($p) $missing=@($p.criteria | ? { $_.image -and -not (Test-Path (ImgFile $_.image)) } | % { $_.image } | Select-Object -Unique)
+              if($missing.Count){ return @{missing=$missing} } # the CLI sends these with putimage, then asks again
+              $res=@(); foreach($c in @($p.criteria)){ $res+=,(TestCriterion $c $p.tolerance) }
+              @{missing=@();results=$res} }
+ screenshot = { param($p) $v=[Windows.Forms.SystemInformation]::VirtualScreen; $area=@{x=$v.X;y=$v.Y;w=$v.Width;h=$v.Height}
+              if($p.window){ $el=Win $p.window; if($p.control){ $el=FindEl $el $p.control }; $area=Rect $el; if(-not $area){ throw 'that window or control is not on screen' } }
+              if($p.rect){ $o=if($p.window){ $area } else { @{x=0;y=0} } # inside a window the rect counts from its top left
+                $area=@{x=$o.x+$p.rect.x;y=$o.y+$p.rect.y;w=$p.rect.w;h=$p.rect.h} }
+              $c=OnScreen $area; if(-not $c){ throw 'that area is not on screen' }
+              $bmp=New-Object Drawing.Bitmap $c.w,$c.h; $g=[Drawing.Graphics]::FromImage($bmp); $g.CopyFromScreen($c.x,$c.y,0,0,$bmp.Size)
+              $ms=New-Object IO.MemoryStream; $bmp.Save($ms,[Drawing.Imaging.ImageFormat]::Png); @{png=[Convert]::ToBase64String($ms.ToArray());w=$c.w;h=$c.h;x=$c.x;y=$c.y} }
 }
 
 # Listeners: always loopback HTTP + token (reached through SSH). With -TlsPort, also HTTPS on all interfaces that

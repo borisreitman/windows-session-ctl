@@ -87,7 +87,7 @@ ${restart("$tn")}`);
 }
 
 // ---- manual install (any Windows machine, no ssh / Azure): the files are copied by hand and this script is run there.
-export function manualInstallScript({ user, port, pfxPassword }) {
+export function manualInstallScript({ user, port }) {
   return `#Requires -RunAsAdministrator
 # windows-session-ctl manual install. Run in an ELEVATED PowerShell, from the folder holding these files:
 #   powershell -ExecutionPolicy Bypass -File .\\install.ps1 [-User <desktop user>]
@@ -101,8 +101,7 @@ foreach($f in 'agent.ps1','ca.crt','server.pfx'){ if(-not (Test-Path "$src\\$f")
 New-Item -ItemType Directory -Force $dir | Out-Null
 if((Resolve-Path $src).Path -ne (Resolve-Path $dir).Path){ Copy-Item "$src\\agent.ps1","$src\\ca.crt" $dir -Force }
 Set-Content "$dir\\tls.port" $port -Encoding ASCII
-$pw = ConvertTo-SecureString '${q(pfxPassword)}' -AsPlainText -Force
-$thumb = (Import-PfxCertificate -FilePath "$src\\server.pfx" -CertStoreLocation Cert:\\LocalMachine\\My -Password $pw).Thumbprint
+$thumb = (Import-PfxCertificate -FilePath "$src\\server.pfx" -CertStoreLocation Cert:\\LocalMachine\\My).Thumbprint
 Get-ChildItem Cert:\\LocalMachine\\My | Where-Object { $_.Issuer -eq 'CN=windows-session-ctl CA' -and $_.Thumbprint -ne $thumb } | Remove-Item
 ${configure}
 ${restart("$tn")}

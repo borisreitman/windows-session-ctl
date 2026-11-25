@@ -16,8 +16,9 @@ you / agent --> CLI (Mac) --HTTP--> SSH tunnel --> agent.ps1 (inside your RDP se
   it later using the existing connection. Neither ever happens implicitly.
 - **It acts in the session you are looking at.** Whatever you see in your RDP window is what the tool sees and drives.
 
-How the CLI talks to a machine is a per-profile setting, `transport`, set with `profile add --transport ssh|https`.
-If omitted it is `https` when you give `--vm` and `ssh` otherwise; it is always stored and shown by `profile list`.
+How the CLI talks to a machine is a per-profile setting, `transport`, set by `install --ssh|--az|--manual` (or
+`profile add --transport ssh|https`). If omitted for a new profile it is `https` when you give `--vm` and `ssh`
+otherwise; it is always stored and shown by `profile list`.
 
 | | `--transport ssh` (needs `--host`) | `--transport https` (`--vm` for Azure, or `--host` for any machine) |
 |---|---|---|
@@ -32,18 +33,16 @@ If omitted it is `https` when you give `--vm` and `ssh` otherwise; it is always 
 |---|---|
 | Mac (or any Unix) | Node 18+, no npm dependencies. `ssh` / `scp` for the ssh transport; `openssl` for https (plus `az` for Azure VMs). |
 | Windows VM | Windows 10/11 with PowerShell 5.1 (built in) plus the OpenSSH server for the ssh transport. |
-| Access | ssh transport: SSH with a private key (`BatchMode`, so no password prompts). https: see *HTTPS transport*. |
+| Access | ssh transport: SSH with a private key (`BatchMode`, so no password prompts). https: see *HTTPS transport*; SSH only for a loopback `--connect`. |
 | Session | Someone **logged in over RDP** (the agent needs an interactive desktop to live in). |
 
 ## Quick start
 
 ```bash
 cd ~/work/windows-session-ctl
-node cli/cli.mjs profile add win11 --host entelecheia-win11-test.eastus.cloudapp.azure.com --key ~/.ssh/azure_test_vm
+# stay logged in over RDP, then install the agent on the VM (one time). This also adds the profile "win11":
+node cli/cli.mjs -p win11 install --ssh --host yourorg-win11-test.eastus.cloudapp.azure.com --key ~/.ssh/azure_test_vm
 # --user defaults to azureuser. With a single profile it is used automatically.
-
-# stay logged in over RDP, then install the agent on the VM (one time):
-node cli/cli.mjs install
 
 # from now on:
 node cli/cli.mjs windows
@@ -88,24 +87,47 @@ Nothing is installed or changed on the VM unless you run one of these:
 
 Every other command only **checks**: if no agent answers it stops with `The agent is not running on '<profile>'. Install it first: …`, and if the agent is older than the CLI it prints a `warning:` on stderr and carries on (a method added in a newer agent may then fail with `unknown method`; run `upgrade`). `status` shows `version`, `expectedVersion` and `upToDate`.
 
-Install and upgrade both use SSH, and the agent never updates itself, so a broken agent can always be replaced. When you
+The agent never updates itself, so a broken agent can always be replaced. When you
 change `agent/agent.ps1`, bump `$Version` there and `AGENT_VERSION` in `cli/cli.mjs` together.
 
-#### Choosing the install method: `--ssh` / `--az`
+#### Choosing the install method: `--ssh` / `--az` / `--manual`
 
 | Command | Installs by | Profile transport afterwards |
 |---|---|---|
-| `install` | the profile's current transport | unchanged |
+| `install` | the profile's transport (new profile: `--az` with `--vm`, else `--ssh`) | unchanged |
 | `install --ssh` | `ssh` + `scp` | `ssh` (loopback agent behind an SSH tunnel) |
 | `install --az` | `az vm run-command` | `https` (mutual TLS) |
 | `install --manual` | you, with the generated files | `https` (mutual TLS) |
 
-The profile is updated only after the install succeeds, and keeps the settings of both methods. Missing details are
-worked out: `--az` on an SSH profile finds the Azure VM that owns its host name or IP; `--ssh` on an HTTPS profile takes the
-DNS name and user from Azure (pass `--key` if the default `~/.ssh/id_ed25519` is wrong). `--vm`, `--resource-group`,
-`--host`, `--key`, `--agent-port` and `--connect` override them. If the agent already answers over the requested method,
-nothing is reinstalled: a different method just switches the profile, the current one is refused (use `upgrade`).
-`upgrade` always uses the profile's transport.
+No `profile add` is needed first. Give everything on the `install` command and it creates the profile named by `-p`:
+
+```bash
+windows-session-ctl -p win11   install --ssh --host vm1.example.com --key ~/.ssh/vm1
+windows-session-ctl -p win11az install --az --vm win11-test      # resource group, DNS name and user are discovered
+windows-session-ctl -p office  install --manual --host pc.example.com
+```
+
+| Option | `--ssh` | `--az` | Default for a new profile |
+|---|---|---|---|
+| `--host H` | this or `--vm` | this or `--vm` | looked up from `--vm` |
+| `--vm NAME` | this or `--host` | this or `--host` | looked up from `--host` (`--az`) |
+| `--resource-group RG` | with `--vm` | with `--vm` | found by VM name |
+| `--user U` | yes | yes | `azureuser`, or the VM's admin user when looked up in Azure |
+| `--key K` (SSH key) | yes | for the tunnel | `~/.ssh/id_ed25519` |
+| `--port P` (local tunnel port) | yes | | first free from 8766 |
+| `--agent-port P` | | yes | 8443 |
+| `--connect host:port` | | yes | the DNS name and agent port (see *Reachability*) |
+
+For `--manual` see *Manual install*. An option already stored in the profile can be omitted, so repeating an install is
+just `windows-session-ctl -p <name> install`; an option you do pass replaces the stored one. With `--host` or `--vm`, a
+name that matches no profile exactly creates a new one, even if it is a prefix of another profile's name.
+
+The profile is saved only after the install succeeds (for `--manual`, once the files are written), so after a failed
+first install pass the options again. It keeps the settings of both remote methods: `--az` on an SSH profile finds the
+Azure VM that owns its host name or IP; `--ssh` on an HTTPS profile takes the DNS name and user from Azure (pass `--key`
+if the default is wrong). If the agent already answers with the requested settings, nothing is reinstalled: new or
+changed connection settings are just saved, unchanged ones are refused (use `upgrade`). `upgrade` always uses the
+profile's transport.
 
 ### What lives on the VM
 
@@ -116,13 +138,18 @@ In `C:\Users\<user>\Downloads\windows-session-ctl\`:
 | `agent.ps1` | the agent |
 | `token` | per-start auth token (restricted ACL) |
 | `agent.log` | one line, written once the agent is listening |
+| `images\` | pictures sent by `wait --image` |
 
 plus a scheduled task named `windows-agent` (on logon, interactive, highest privileges). To remove everything:
 `schtasks /Delete /TN windows-agent /F` and delete the folder.
 
 ## Command reference
 
-Run `node cli/cli.mjs` with no arguments (or `help`) for the built-in usage text. Output is JSON unless noted.
+Run `node cli/cli.mjs` with no arguments (or `help`) for the built-in usage text.
+
+**Output.** Every command writes one JSON document to stdout, errors included (`{"error": "…"}`, non-zero exit status).
+Progress messages and warnings go to stderr. The exception is `exec` and `psexec`, which pass the program's own stdout,
+stderr and exit code through (and report the tool's own errors as plain text on stderr).
 
 ### Setup and connection
 
@@ -131,9 +158,10 @@ Run `node cli/cli.mjs` with no arguments (or `help`) for the built-in usage text
 | `profile add <name> --host H [--user U] [--key K] [--port P]` | Save a target machine (stored in `~/.config/windows-session-ctl/config.json`). Re-running with the same name updates it. The local tunnel port is assigned automatically (8766, 8767, …) unless you pass `--port`. |
 | `profile list` (alias `profiles`) / `profile rm <name>` | List profiles / remove one (closes its tunnel and deletes its cached token). |
 | `--profile <name>` / `-p <name>` | Run any command against that profile. A unique name prefix is enough. Also `$WINSESSION_PROFILE`. |
-| `install [--ssh\|--az]` | First install of the agent on the VM (see *Install and upgrade*). |
+| `-p <name> install [--ssh\|--az] [options]` | First install of the agent on the VM, creating the profile if it is new (see *Install and upgrade*). |
+| `-p <name> install --manual [--host H]` | Write the files for a hand-carried install, creating the profile if it is new (see *Manual install*). |
 | `upgrade [--force]` | Replace the agent with this CLI's version, through the existing connection. |
-| `up` / `down` | Open / close the SSH tunnel. Other commands open it on demand. |
+| `up` / `down` | Open / close the SSH tunnel (`ssh` profiles, and `https` profiles with a loopback `--connect`). Other commands open it on demand. |
 | `status` | `{host, tunnel, agent, version, session, screen, user}`. Only reports; it never installs or changes anything. |
 | `info` | Agent version, session id, user, host, screen size, cursor position. |
 
@@ -144,8 +172,8 @@ Run `node cli/cli.mjs` with no arguments (or `help`) for the built-in usage text
 | `windows` | Visible top-level windows: type, name, class, process id, rectangle. |
 | `tree <window> [depth]` | The control tree of a window (default depth 8, at most 800 nodes). Each node has `type`, `name`, optional `id` (AutomationId), `rect`, and `disabled`. |
 | `find <window> <text>` | Flat list of controls whose name **or** AutomationId contains `text` (case-insensitive). |
-| `gettext <window> [--control c]` | The text of a control (printed as plain text: Value pattern, else Text pattern, else its name). |
-| `screenshot [path] [--window w]` | PNG of the whole virtual screen, or cropped to a window. Returns `{saved, w, h, x, y}`; `x`,`y` is the capture origin in screen coordinates. Default path `windows-screenshot.png`. |
+| `gettext <window> [--control c]` | The text of a control as `{text}` (Value pattern, else Text pattern, else its name). |
+| `screenshot [path] [--window w [--control c]] [--rect x,y,w,h]` | PNG of the whole virtual screen, a window, a control, or a rectangle. `--rect` is in screen coordinates, or counted from the top left of the window/control when `--window` is given. Parts off screen are cut off. Returns `{saved, w, h, x, y}`; `x`,`y` is the capture origin in screen coordinates. Default path `windows-screenshot.png`. |
 
 ### Acting on controls (no coordinates)
 
@@ -208,6 +236,80 @@ started from them appear on the desktop. Output is UTF-8 in both.
 | `type <text> [--window w]` | Send text to the focused window. With `--window`, that window is brought to the front first. Special characters (`+ ^ % ~ ( ) { } [ ]`) are escaped, so the text is typed literally. |
 | `key <keys> [--window w]` | Send keys in [SendKeys syntax](https://learn.microsoft.com/dotnet/api/system.windows.forms.sendkeys): `^c` Ctrl+C, `%{F4}` Alt+F4, `{ENTER}`, `{TAB}`, `^{ESC}` Ctrl+Esc (opens Start), `{ESC}`. The Windows key cannot be sent. |
 
+### Waiting for something to appear
+
+`wait` returns as soon as the screen shows what you describe, instead of sleeping and re-taking screenshots.
+
+```bash
+windows-session-ctl wait --text "Installation complete"                         # anywhere on screen
+windows-session-ctl wait --window "App Installer" --text Launch --timeout 300   # text in one window
+windows-session-ctl wait --image ok-button.png                                  # a graphic anywhere on screen
+windows-session-ctl wait --window "My App" --image done.png --control Status --text Ready
+windows-session-ctl wait --window Notepad --text saved --screen --image tray-icon.png
+```
+
+| Option | Meaning |
+|---|---|
+| `--text S` | `S` appears (any case) in the name, value or document text of an on-screen control. |
+| `--image FILE` | The picture in `FILE` (PNG, BMP, GIF, JPEG) appears. |
+| `--window W` | Look only in this window, for the criteria **after** it. |
+| `--control C` | Look only in this control of that window (name or automation id), for the criteria after it. |
+| `--screen` | Look at the whole screen again, for the criteria after it (the default at the start). |
+| `--timeout s` | Give up if not found after `s` seconds (default 60): print `[]` and exit with code **124**. |
+| `--interval ms` | Pause between checks (default 500). |
+| `--tolerance N` | Allowed difference per colour channel, 0-255, when matching images (default 10; 0 = exact). |
+
+**All** criteria must hold in the same check. A window or control that does not exist yet simply does not match.
+
+**Output** is a JSON array with one entry for **every place** each criterion was found. Each entry has its `rect` and
+`center` in screen coordinates (`center` is ready for `mouse click`):
+
+```json
+[
+  { "image": "ok-button.png", "rect": { "x": 218, "y": 171, "w": 80, "h": 50 }, "center": { "x": 258, "y": 196 } },
+  { "image": "ok-button.png", "rect": { "x": 618, "y": 171, "w": 80, "h": 50 }, "center": { "x": 658, "y": 196 } }
+]
+```
+
+An entry also repeats its `window` / `control` if given; a text entry has `text` instead of `image`, plus the `type` and
+`name` of the control showing it. If time runs out the array is empty (`[]`), stderr says what was missing, and the exit
+code is 124. Image places never overlap, and each criterion reports at most 100 places. `--timeout 0` checks once. A
+check already running when the time is up is finished first.
+
+To see what was matched, capture an entry's `rect`:
+
+```bash
+windows-session-ctl screenshot match.png --rect 218,171,80,50
+```
+
+For an image, `rect` is exactly the matched pixels. For text it surrounds the characters, with a margin that follows
+their line height, when the app reports where they are (editors usually do); otherwise it is the control showing the
+text, or the top left of a tall control.
+
+- **Images** are matched pixel for pixel at their own size, without scaling: crop them from a `screenshot` taken at the
+  same resolution and display scaling. Transparent pixels of the template are ignored. Only what is visible counts, so a
+  covered or minimised window does not match.
+- Each image is copied to the VM the first time it is used (stored by content hash in
+  `Downloads\windows-session-ctl\images\`) and reused afterwards.
+- **Text** is read through UI Automation, not OCR: text that is only drawn as pixels needs `--image`. Text of a covered
+  window can still match; text scrolled out of view does not when the app reports where its characters are. Searching one window is much faster than the
+  whole screen.
+- The CLI polls, so other commands can run while a `wait` is in progress.
+
+#### Making a template
+
+Cut templates on the machine itself. A screenshot taken on your Mac of the remote desktop has a different scale and
+colour profile, and will not match.
+
+```bash
+windows-session-ctl screenshot screen.png                      # 1. look for the coordinates
+windows-session-ctl screenshot start.png --rect 456,913,25,25  # 2. cut out the graphic
+windows-session-ctl wait --image start.png                     # 3. find it
+```
+
+Cut tightly: background around an icon may change (a translucent taskbar, a hover highlight). Pixels can also differ by a
+level between two captures (seen on the taskbar), so leave `--tolerance` at its default rather than 0.
+
 ### Resolution-change guard
 
 When the RDP window is resized, the client rescales the picture and then changes the VM's resolution, which re-lays-out
@@ -217,7 +319,7 @@ action from landing on the wrong thing, the agent records the screen size and or
 compares the current screen with that record and, if it changed, fails with:
 
 ```
-error: screen-changed: the screen changed from 1498x917@0,0 to 1376x802@0,0 since the pointer was placed at (700,400), ...
+{ "error": "screen-changed: the screen changed from 1498x917@0,0 to 1376x802@0,0 since the pointer was placed at (700,400), ..." }
 ```
 
 Nothing is clicked. Re-check with `screenshot`, `tree` or `find`, then `mouse move` again. A click with no coordinates and
@@ -233,7 +335,7 @@ or an app re-laying-out content at the same resolution.
   fragment such as `Notepad`.
 - **Controls** are matched by exact Name or AutomationId first, then by Name substring. `*` means "first edit or
   document control".
-- If nothing matches, the command exits non-zero with `error: no window matching '…'` / `no control matching '…'`.
+- If nothing matches, the command exits non-zero with `{"error": "no window matching '…'"}` / `"no control matching '…'"`.
 
 ## Recommended workflow
 
@@ -241,6 +343,7 @@ or an app re-laying-out content at the same resolution.
 windows                              # what is open?
 tree "My App" 4                      # what controls does it have? (names, ids, rectangles)
 click "My App" "Save"                # act by name
+wait --window "My App" --text Saved  # until it shows up
 gettext "My App" --control Status    # verify by reading, not by looking
 screenshot --window "My App"         # only when you need to see it (visual check, custom-drawn UI)
 ```
@@ -250,12 +353,13 @@ name or `id` in `tree`, fall back to `mouse click` using the `rect` from `tree` 
 
 ## Profiles
 
-A profile is a named target machine: SSH host, user (default `azureuser`), key (default `~/.ssh/id_ed25519`), and its own
+A profile is a named target machine. `install` adds it (`profile add` saves one without installing). An SSH profile holds
+the host, user (default `azureuser`), key (default `~/.ssh/id_ed25519`) and its own
 local tunnel port.
 
 ```bash
-windows-session-ctl profile add win11 --host vm1.example.com --key ~/.ssh/vm1
-windows-session-ctl profile add build --host vm2.example.com --user builder --key ~/.ssh/vm2
+windows-session-ctl -p win11 install --ssh --host vm1.example.com --key ~/.ssh/vm1
+windows-session-ctl -p build install --ssh --host vm2.example.com --user builder --key ~/.ssh/vm2
 windows-session-ctl profile list
 windows-session-ctl -p build windows
 WINSESSION_PROFILE=win11 windows-session-ctl psexec 'Get-Date'
@@ -283,18 +387,18 @@ fixed port and install folder per user, and the logon task runs for one user.
 
 ```bash
 az login                                            # subscription that holds the VM
-windows-session-ctl profile add win11az --transport https --vm win11-test  # resource group, DNS name and user are discovered
-windows-session-ctl -p win11az install                         # via az vm run-command; takes about a minute
+# via az vm run-command; takes about a minute. Resource group, DNS name and user are discovered.
+windows-session-ctl -p win11az install --az --vm win11-test
 windows-session-ctl -p win11az windows
 windows-session-ctl -p win11az upgrade                         # later, also via run-command
 ```
 
 An `https` profile is either an Azure VM (`--vm`, installed with `az vm run-command`) or any other Windows machine
-(`--host <dns-name-or-ip>`, installed by hand: see *Manual install*). Flags that
-belong to the other transport are rejected. To switch a profile, run `profile add` again with the same name.
+(`--host <dns-name-or-ip>`, installed by hand: see *Manual install*). To switch a profile's transport, run `install`
+again with the other method.
 
-Options for `profile add`: `--resource-group RG` (needed only if the VM name is ambiguous), `--user U` (desktop user,
-default the VM's admin user), `--agent-port P` (default 8443), `--connect host:port` (see *Reachability*).
+Options: `--resource-group RG` (needed only if the VM name is ambiguous), `--user U` (desktop user, default the VM's
+admin user), `--agent-port P` (default 8443), `--connect host:port` (see *Reachability*).
 
 Needs: Azure CLI logged in with permission to run commands on the VM, `openssl` locally, a **running** Windows VM whose
 public IP has a DNS name, and someone logged in on its desktop.
@@ -317,9 +421,22 @@ and checks the DNS name.
 ### Manual install (any Windows machine, no SSH, no Azure)
 
 ```bash
-windows-session-ctl profile add office --transport https --host pc.example.com     # name or IP the CLI will connect to
-windows-session-ctl -p office install --manual                                    # writes tmp/windows-session-ctl-office-install/
+# --host is the name or IP the CLI will connect to; writes tmp/windows-session-ctl-office-install/
+windows-session-ctl -p office install --manual --host pc.example.com
 ```
+
+As with the other methods, the command creates the profile named by `-p` and records what you pass. An option already
+stored in that profile can be omitted, so repeating the install is just `windows-session-ctl -p office install --manual`
+(add `--force` if the agent already answers). An option you do pass replaces the stored one.
+
+| Option | Needed | Default for a new profile |
+|---|---|---|
+| `--host H` | for a new profile, or one with no host yet | none |
+| `--user U` | no | whoever runs `install.ps1` |
+| `--agent-port P` | no | 8443 |
+| `--connect host:port` | no | connect to `--host` on the agent port (see *Reachability*) |
+| `--key K` | no (SSH tunnel only) | `~/.ssh/id_ed25519` |
+| `--out DIR` | no (never stored) | `tmp/windows-session-ctl-<name>-install` |
 
 The folder (under `tmp/` in the current directory, or `--out DIR`) contains:
 
@@ -327,8 +444,8 @@ The folder (under `tmp/` in the current directory, or `--out DIR`) contains:
 |---|---|
 | `agent.ps1` | the agent |
 | `ca.crt` | the CA the agent will accept client certificates from |
-| `server.pfx` | the machine's TLS certificate **and private key**, password protected |
-| `install.ps1` | the install script (contains that password) |
+| `server.pfx` | the machine's TLS certificate **and private key**, not password protected |
+| `install.ps1` | the install script |
 
 Copy the folder to the Windows machine any way you like, and there, in an **elevated** PowerShell inside it:
 
@@ -340,12 +457,13 @@ The script copies the agent to that user's `Downloads\windows-session-ctl`, impo
 the Windows firewall, registers and starts the logon task, and deletes `server.pfx`. Then check with
 `windows-session-ctl -p office status`.
 
-- The certificate is issued for the profile's `--host` (a DNS name or an IP address); connect by that same value. To change
+- The certificate is issued for the profile's host (a DNS name or an IP address); connect by that same value. To change
   it, run `install --manual --host <new> --force`.
 - **The package holds a private key.** Unlike the Azure install (where the key is created on the machine and never leaves
   it), there is no channel to fetch a signing request, so the key is generated on your computer. Move the folder over a
-  channel you trust and delete your copy; `tmp/` is ignored by git in this repository.
-- `--user` on `profile add` or `install --manual` pre-fills the script's `-User`. The user must be a local account whose
+  channel you trust (anyone who gets it can impersonate the machine) and delete your copy; `tmp/` is ignored by git in this
+  repository.
+- A `--user` stored in the profile pre-fills the script's `-User`. The user must be a local account whose
   profile folder is `C:\Users\<name>`.
 - Upgrade the same way: `upgrade --manual` writes `agent.ps1` and `upgrade.ps1`; run the latter elevated. The CLI warns
   when the machine's agent is older than itself.
@@ -354,13 +472,18 @@ the Windows firewall, registers and starts the logon task, and deletes `server.p
 
 **The tool never creates or changes an Azure Network Security Group.** After install, your machine must be able to reach
 `<dns-name>:<agent-port>` by a route you provide: an NSG rule you manage (for example in Terraform), a VPN or mesh
-network, or a tunnel. If it cannot, `install` says so and the agent is still installed. To go through a tunnel or private
-address, use `--connect host:port`; the certificate is still verified against the DNS name:
+network, or a tunnel. If it cannot, `install` says so and the agent is still installed. For a private address or a
+tunnel, use `--connect host:port`; the certificate is still verified against the DNS name.
+
+**SSH tunnel.** If the machine accepts SSH, point `--connect` at a free loopback port. The CLI then opens
+`ssh -N -L 18443:127.0.0.1:8443 <user>@<host>` itself whenever nothing is listening on that port, and `down` closes it:
 
 ```bash
-ssh -N -L 18443:127.0.0.1:8443 azureuser@<vm> &       # example tunnel, if you have SSH after all
-windows-session-ctl profile add win11az --vm win11-test --connect 127.0.0.1:18443
+windows-session-ctl -p win11az install --az --vm win11-test --connect 127.0.0.1:18443   # --key K if not ~/.ssh/id_ed25519
 ```
+
+The SSH user is the profile's `--user` (default `azureuser`), the host its `--host` or else the DNS name. A tunnel you
+already run on that port is used as it is.
 
 `upgrade` needs a working connection (it checks the running version first); `install` does not.
 
@@ -420,7 +543,7 @@ ready for this tool (RDP, OpenSSH, DNS name). Replace the `yourorg` placeholder 
 ## Layout
 
 ```
-agent/agent.ps1          the in-session agent (UIA, SendInput, exec/psexec, screenshots, HTTP + mTLS server)
+agent/agent.ps1          the in-session agent (UIA, SendInput, exec/psexec, screenshots, wait checks, HTTP + mTLS server)
 cli/cli.mjs              the CLI (profiles, tunnel, install/upgrade, commands)
 cli/azure.mjs            find a VM and run PowerShell on it with `az vm run-command`
 cli/vm-scripts.mjs       the PowerShell that Azure install / upgrade runs on the VM

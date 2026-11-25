@@ -11,8 +11,8 @@ export const PKI_DIR = join(homedir(), ".config", "windows-session-ctl", "pki");
 export const CA_CRT = join(PKI_DIR, "ca.crt"), CLIENT_CRT = join(PKI_DIR, "client.crt"), CLIENT_KEY = join(PKI_DIR, "client.key");
 const CA_KEY = join(PKI_DIR, "ca.key");
 
-function openssl(args, env) {
-  const r = spawnSync("openssl", args, { encoding: "utf8", env: { ...process.env, ...env } });
+function openssl(args) {
+  const r = spawnSync("openssl", args, { encoding: "utf8" });
   if (r.error) throw new Error("openssl not found on PATH");
   if (r.status !== 0) throw new Error(`openssl ${args[0]} failed: ${(r.stderr || "").trim()}`);
   return r.stdout;
@@ -51,17 +51,15 @@ export function signServerCsr(csrPem, host) {
 }
 
 // Manual install: there is no channel to fetch a signing request, so the server key is made here and shipped as a
-// password-protected PKCS#12 file (the install script imports it and deletes it).
+// PKCS#12 file with an empty password (the install script imports it and deletes it).
 export function createServerPfx(host, outFile) {
   ensurePki();
   const key = join(PKI_DIR, "server-manual.key"), csr = join(PKI_DIR, "server-manual.csr"), crt = join(PKI_DIR, "server-manual.crt");
-  const password = randomBytes(18).toString("base64url");
   try {
     openssl(["ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", key]); priv(key);
     openssl(["req", "-new", "-key", key, "-subj", "/CN=windows-session-ctl agent", "-out", csr]);
     writeFileSync(crt, signServerCsr(readFileSync(csr, "utf8"), host));
-    openssl(["pkcs12", "-export", "-inkey", key, "-in", crt, "-name", "windows-session-ctl agent", "-out", outFile, "-passout", "env:WSC_PFX_PASSWORD"], { WSC_PFX_PASSWORD: password });
+    openssl(["pkcs12", "-export", "-inkey", key, "-in", crt, "-name", "windows-session-ctl agent", "-out", outFile, "-passout", "pass:"]);
     priv(outFile);
   } finally { for (const f of [key, csr, crt]) rmSync(f, { force: true }); }
-  return password;
 }
