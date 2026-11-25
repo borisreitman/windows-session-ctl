@@ -188,7 +188,7 @@ stderr and exit code through (and report the tool's own errors as plain text on 
 | Command | What it does |
 |---|---|
 | `focus <window>` | Restore and bring the window to the front. |
-| `click <window> <name\|id>` | Activate a control. Tries Invoke, then Toggle, then Select, then Expand; if the control supports none of them, it clicks the centre of its rectangle (`via: click-center`). |
+| `click <window> <name\|id> [--beside text]` | Activate a control. Tries Invoke, then Toggle, then Select, then Expand; if the control supports none of them, it clicks the centre of its rectangle (`via: click-center`). A disabled control is an error. `--beside` picks the control next to a given text (see *Matching rules*). |
 | `settext <window> <text> [--control c]` | Set an edit box or document. Uses the Value pattern; if the control is read-only or lacks it, it focuses the control, presses Ctrl+A and types the text. Without `--control` it targets the first Edit or Document control. |
 
 ### Running commands
@@ -254,6 +254,8 @@ windows-session-ctl wait --window "App Installer" --text Launch --timeout 300   
 windows-session-ctl wait --image ok-button.png                                  # a graphic anywhere on screen
 windows-session-ctl wait --window "My App" --image done.png --control Status --text Ready
 windows-session-ctl wait --window Notepad --text saved --screen --image tray-icon.png
+windows-session-ctl wait --window "My App" --control OkButton                  # until a control exists
+windows-session-ctl wait --window "My App" --text Installing --gone            # until it disappears
 ```
 
 | Option | Meaning |
@@ -261,13 +263,16 @@ windows-session-ctl wait --window Notepad --text saved --screen --image tray-ico
 | `--text S` | `S` appears (any case) in the name, value or document text of an on-screen control. |
 | `--image FILE` | The picture in `FILE` (PNG, BMP, GIF, JPEG) appears. |
 | `--window W` | Look only in this window, for the criteria **after** it. |
-| `--control C` | Look only in this control of that window (name or automation id), for the criteria after it. |
+| `--control C` | Look only in this control of that window (name or automation id), for the criteria after it. With no `--text` or `--image` after it, the criterion is the control itself being on screen. |
+| `--beside S` | Narrow that `--control` to the one next to the text `S` (see *Matching rules*). |
+| `--gone` | Wait until **none** of the criteria is found. Prints `[]`; on timeout the exit code is 124. A window or control that does not exist counts as gone. |
 | `--screen` | Look at the whole screen again, for the criteria after it (the default at the start). |
 | `--timeout s` | Give up if not found after `s` seconds (default 60): print `[]` and exit with code **124**. |
 | `--interval ms` | Pause between checks (default 500). |
 | `--tolerance N` | Allowed difference per colour channel, 0-255, when matching images (default 10; 0 = exact). |
 
-**All** criteria must hold in the same check. A window or control that does not exist yet simply does not match.
+**All** criteria must hold in the same check. A window or control that does not exist yet simply does not match. Since
+that also satisfies `--gone`, follow it with an ordinary `wait` if the window itself must still be there.
 
 **Output** is a JSON array with one entry for **every place** each criterion was found. Each entry has its `rect` and
 `center` in screen coordinates (`center` is ready for `mouse click`):
@@ -343,6 +348,9 @@ or an app re-laying-out content at the same resolution.
   fragment such as `Notepad`.
 - **Controls** are matched by exact Name or AutomationId first, then by Name substring. `*` means "first edit or
   document control".
+- `--beside S` selects, among the controls whose Name or AutomationId is exactly `<name|id>`, the one with the **same
+  parent** as a control named exactly `S` (any case): for instance one button of the many identical ones in a list,
+  `click Settings AppOptionsButton --beside Crosspass`. `click` refuses if several qualify.
 - If nothing matches, the command exits non-zero with `{"error": "no window matching '…'"}` / `"no control matching '…'"`.
 
 ## Recommended workflow

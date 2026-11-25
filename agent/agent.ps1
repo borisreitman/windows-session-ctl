@@ -2,7 +2,7 @@
 # serves JSON commands on 127.0.0.1:$Port. Reach it from the Mac through an SSH tunnel; never expose it.
 param([int]$Port=8766,[int]$TlsPort=0,[string]$Dir=(Join-Path $env:USERPROFILE 'Downloads\windows-session-ctl'))
 $ErrorActionPreference='Stop'
-$Version=14
+$Version=16
 New-Item -ItemType Directory -Force $Dir | Out-Null
 Add-Type -AssemblyName System.Windows.Forms,System.Drawing,UIAutomationClient,UIAutomationTypes
 Add-Type @'
@@ -72,6 +72,15 @@ function FindEl($win,$q){
   else { foreach($e in $d){ if($e.Current.Name -eq $q -or $e.Current.AutomationId -eq $q){return $e} }
          foreach($e in $d){ if($e.Current.Name -like "*$q*"){return $e} } }
   throw "no control matching '$q'" }
+# Every control named (or with the automation id) exactly $q that has the same parent as a control named exactly
+# $text: the button in one row of a list. Siblings only, so that a label elsewhere in the window selects nothing.
+function Beside($win,$q,$text){
+  $named=New-Object Windows.Automation.PropertyCondition ($UIA::NameProperty,[string]$text,[Windows.Automation.PropertyConditionFlags]::IgnoreCase)
+  $up=[Windows.Automation.TreeWalker]::ControlViewWalker; $found=@(); $seen=@{}
+  foreach($a in $win.FindAll($Sc::Descendants,$named)){ $parent=$up.GetParent($a); if(-not $parent){ continue }
+    foreach($e in $parent.FindAll($Sc::Children,$All)){ if($e.Current.Name -eq $q -or $e.Current.AutomationId -eq $q){
+      $id=$e.GetRuntimeId() -join '.'; if(-not $seen.ContainsKey($id)){ $seen[$id]=$true; $found+=,$e } } } }
+  ,$found }
 function Walk($e,$d,$max,$cnt){ if($cnt.n -ge 800){return}; $cnt.n++; $o=Node $e; $kids=@()
   if($d -lt $max){ $w=[Windows.Automation.TreeWalker]::ControlViewWalker; $k=$w.GetFirstChild($e); while($k){ $kids+=,(Walk $k ($d+1) $max $cnt); $k=$w.GetNextSibling($k) } }
   if($kids.Count){$o.children=$kids}; $o }
@@ -137,12 +146,23 @@ function FindImage($el,$hash,$tol){
     $px=[Img]::Pixels($bmp) } finally{ $bmp.Dispose() }
   $hits=@([Img]::Find($px,$area.Width,$area.Height,$t.p,$t.w,$t.h,[int]$tol,$MaxMatches) | % { @{rect=@{x=$area.X+$_[0];y=$area.Y+$_[1];w=$t.w;h=$t.h}} })
   @{matches=$hits} }
+function Shown($els){ # the controls themselves, where they are on screen
+  $found=@(); foreach($e in $els){ if($found.Count -ge $MaxMatches -or $e.Current.IsOffscreen){ continue }
+    $r=Rect $e; if($r){ $r=OnScreen $r }; if($r){ $found+=,@{type=(CT $e);name=$e.Current.Name;rect=$r} } }
+  ,$found }
 function TestCriterion($c,$tol){
-  try{ $el=$null; if($c.window){ $el=Win $c.window; if($c.control){ $el=FindEl $el $c.control } }
-    if($c.image){ return (FindImage $el $c.image $tol) }
-    $roots=if($el){ $el } else { $UIA::RootElement.FindAll($Sc::Children,$All) }
+  try{ $els=@()
+    if($c.window){ $w=Win $c.window
+      if($c.beside){ $els=Beside $w $c.control $c.beside
+        if(-not $els.Count){ return @{matches=@();reason="no control matching '$($c.control)' beside '$($c.beside)'"} } }
+      elseif($c.control){ $els=@(FindEl $w $c.control) } else { $els=@($w) } }
+    if($c.image){ if(-not $els.Count){ return (FindImage $null $c.image $tol) }
+      $r=@($els | % { FindImage $_ $c.image $tol }); return @{matches=@($r | % { $_.matches });reason=$r[0].reason} }
+    if($null -eq $c.text){ return @{matches=(Shown $els)} }
+    $roots=if($els.Count){ $els } else { $UIA::RootElement.FindAll($Sc::Children,$All) }
     return @{matches=(FindText $roots ([string]$c.text))}
-  }catch{ return @{matches=@();reason="$($_.Exception.Message)"} } } # e.g. the window does not exist (yet)
+  }catch{ $m="$($_.Exception.Message)" # a window or control may not exist (yet): that is absence, other errors are not
+    return @{matches=@();reason=$m;failed=($m -notmatch '^no (window|control) matching')} } }
 
 $M=@{
  ping       = { @{ok=$true;version=$Version} }
@@ -151,7 +171,13 @@ $M=@{
  tree       = { param($p) $w=Win $p.window; $max=if($p.depth){[int]$p.depth}else{8}; Walk $w 0 $max @{n=0} }
  find       = { param($p) $w=Win $p.window; $l=@(); foreach($e in $w.FindAll($Sc::Descendants,$All)){ $c=$e.Current; if($c.Name -like "*$($p.query)*" -or $c.AutomationId -like "*$($p.query)*"){ $l+=,(Node $e) } }; ,$l }
  focus      = { param($p) Raise (Win $p.window); @{ok=$true} }
- invoke     = { param($p) $w=Win $p.window; Raise $w; $e=FindEl $w $p.name; $q=$null
+ invoke     = { param($p) $w=Win $p.window; Raise $w; $q=$null
+              if($null -eq $p.beside){ $e=FindEl $w $p.name }
+              else{ $found=Beside $w $p.name $p.beside
+                if(-not $found.Count){ throw "no control matching '$($p.name)' beside '$($p.beside)'" }
+                if($found.Count -gt 1){ throw "$($found.Count) controls match '$($p.name)' beside '$($p.beside)'; not choosing between them" }
+                $e=$found[0] }
+              if(-not $e.Current.IsEnabled){ throw "control '$($p.name)' is disabled" }
               if($e.TryGetCurrentPattern([Windows.Automation.InvokePattern]::Pattern,[ref]$q)){$q.Invoke();@{via='invoke'}}
               elseif($e.TryGetCurrentPattern([Windows.Automation.TogglePattern]::Pattern,[ref]$q)){$q.Toggle();@{via='toggle'}}
               elseif($e.TryGetCurrentPattern([Windows.Automation.SelectionItemPattern]::Pattern,[ref]$q)){$q.Select();@{via='select'}}
@@ -189,7 +215,8 @@ $M=@{
                 if(-not $pr.WaitForExit($ms)){ try{$pr.Kill()}catch{}; @{timedOut=$true;exitCode=-1;stdout=$o.Result;stderr=$e.Result} }
                 else { $pr.WaitForExit(); @{timedOut=$false;exitCode=$pr.ExitCode;stdout=$o.Result;stderr=$e.Result} } }
               finally { if($tmp){ Remove-Item $tmp -ErrorAction SilentlyContinue } } }
- launch     = { param($p) Start-Process -FilePath $p.path -ArgumentList $p.args; @{ok=$true} }
+ launch     = { param($p) $o=@{FilePath=$p.path}; if($p.args){$o.ArgumentList=$p.args} # Start-Process rejects an empty one
+              Start-Process @o; @{ok=$true} }
  putimage   = { param($p) $f=ImgFile $p.hash; $b=[Convert]::FromBase64String($p.data)
               $h=-join ([Security.Cryptography.SHA256]::Create().ComputeHash($b) | % { $_.ToString('x2') })
               if($h -ne $p.hash){ throw 'image data does not match its hash' }

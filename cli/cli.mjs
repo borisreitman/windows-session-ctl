@@ -23,7 +23,7 @@ const TOKEN_DIR = join(CFG_DIR, "tokens");
 const AGENT_PORT = 8766;
 const DEFAULT_TLS_PORT = 8443;
 const rdir = (t) => `C:\\Users\\${t.user}\\Downloads\\windows-session-ctl`; // install dir on the VM
-const AGENT_VERSION = 14; // keep in step with $Version in agent/agent.ps1
+const AGENT_VERSION = 16; // keep in step with $Version in agent/agent.ps1
 
 const USAGE = `Drive the Windows desktop session a user is logged into (RDP or console), over SSH.
 
@@ -50,7 +50,8 @@ const USAGE = `Drive the Windows desktop session a user is logged into (RDP or c
   windows-session-ctl tree <window> [depth]         controls inside a window (UI Automation tree, JSON)
   windows-session-ctl find <window> <text>          controls whose name / automation id contains text
   windows-session-ctl focus <window>
-  windows-session-ctl click <window> <name|id>      Invoke/Toggle/Select by name, no coordinates needed
+  windows-session-ctl click <window> <name|id> [--beside <text>]   Invoke/Toggle/Select by name, no coordinates needed
+        --beside: the control next to (same parent as) the one named exactly <text>; refused if several match
   windows-session-ctl settext <window> <text> [--control <name|id>]   set an edit box / document (default: first one)
   windows-session-ctl gettext <window> [--control <name|id>]
   windows-session-ctl type <text> [--window <w>]    keystrokes to the focused window
@@ -61,12 +62,14 @@ const USAGE = `Drive the Windows desktop session a user is logged into (RDP or c
   windows-session-ctl mouse scroll <delta> [x y]    120 = one notch up, -120 = down; same resolution guard without x y
   windows-session-ctl screenshot [path] [--window <w> [--control <name|id>]] [--rect x,y,w,h]
         capture the screen, a window, a control or a rectangle (counted from the window's top left with --window)
-  windows-session-ctl wait <criteria> [--timeout s] [--interval ms] [--tolerance 0-255]
+  windows-session-ctl wait <criteria> [--gone] [--timeout s] [--interval ms] [--tolerance 0-255]
         wait until every criterion is on screen (default 60 s, every 500 ms); prints a JSON array with one entry per
         place found, each with "rect" {x,y,w,h} (see it with: screenshot out.png --rect x,y,w,h) and "center";
         if not found within --timeout it prints [] and exits with 124
-        criteria: --text <string> | --image <file>, repeatable; the image is copied to Windows once
-        where to look: --window <w> [--control <name|id>] applies to the criteria AFTER it; --screen goes back to all of it
+        criteria: --text <string> | --image <file>, repeatable; the image is copied to Windows once;
+        a --control with neither after it is a criterion too: the control itself is on screen
+        where to look: --window <w> [--control <name|id> [--beside <text>]] applies to the criteria AFTER it; --screen goes back to all of it
+        --gone: wait until none of the criteria is found any more (prints [])
   windows-session-ctl launch <exe> [args]           start a program in the session, do not wait
   windows-session-ctl exec <cmd-command> [--timeout s]  run a CMD command/batch script in the session (arg, or stdin when piped), wait, print stdout; exit code passed through
   windows-session-ctl psexec <powershell> [--timeout s]  same, for PowerShell
@@ -191,7 +194,8 @@ async function installAgent(t) {
   }
   die("Agent did not start. Is anyone logged in over RDP on the VM?");
 }
-let checked = false, lastError = "";
+let checked = false, lastError = "", agentFound = 0;
+const BESIDE_VERSION = 16; // first agent with --beside, control criteria and --gone; older ones would ignore them
 async function tryCall(t, method, params) {
   if (t.transport === "https") return call(t, method, params).catch((e) => { lastError = e.message; return null; });
   let tok = existsSync(tokenFile(t)) ? readFileSync(tokenFile(t), "utf8") : "";
@@ -348,16 +352,17 @@ async function agentVersion(t) { // null when no agent answers
   return p && p.body.ok ? p.body.result.version || 0 : null;
 }
 const me = (t) => `windows-session-ctl${t.name.startsWith("env-") ? "" : ` -p ${t.name}`}`;
-async function rpc(method, params = {}) {
+async function rpc(method, params = {}, since = 0) {
   const t = target(); await up(t);
   if (!checked) { // never installs or updates by itself: only reports, and points at `install`
     checked = true;
     const p = await tryCall(t, "ping", {});
     if ((!p || !p.body.ok) && t.transport === "https") die(`No agent answers on ${t.connect || `${t.fqdn || t.vm}:${t.agentPort}`} (mutual TLS)${lastError ? `: ${lastError}` : ""}.${tunnelError ? ` ${tunnelError}` : ""} If it is installed, the port is probably not reachable from here: the tool never changes the NSG, so open TCP ${t.agentPort} to your address yourself, use a VPN, or tunnel over SSH with --connect 127.0.0.1:18443. Not installed yet: ${me(t)} install${t.vm ? "" : " --manual"}`);
     if (!p || !p.body.ok) die(`The agent is not running on '${t.name}'. Install it first: ${me(t)} install  (needs someone logged in on the VM)`);
-    const v = p.body.result.version || 0;
+    const v = agentFound = p.body.result.version || 0;
     if (v < AGENT_VERSION) console.error(`warning: the agent on '${t.name}' is version ${v}, this CLI expects ${AGENT_VERSION}. Update it with: ${me(t)} upgrade`);
   }
+  if (agentFound < since) die(`this needs agent version ${since}; '${t.name}' has ${agentFound}. Update it with: ${me(t)} upgrade`);
   const r = await tryCall(t, method, params);
   if (!r) die("Agent not answering. Is a desktop session logged in on the VM?");
   if (!r.body.ok) die(`error: ${r.body.error}`);
@@ -380,20 +385,28 @@ const print = (v) => console.log(JSON.stringify(v ?? null, null, 2)); // stdout 
 
 // `wait`: turn the ordered flags into criteria. Scope flags apply to the criteria that follow them.
 function waitCriteria() {
-  const criteria = [], images = new Map(); let window, control, unused;
+  const criteria = [], images = new Map(); let window, control, beside, unused;
+  const flush = () => { // a --control that no --text or --image used asks for the control itself
+    if (unused === "--control") { criteria.push({ window, control, beside }); unused = undefined; }
+  };
   for (const [flag, value] of waitArgs) {
     if (flag !== "--screen" && !value) die(`wait: ${flag} needs a value`);
-    if (flag === "--text") criteria.push({ window, control, text: value });
+    if (flag === "--text") criteria.push({ window, control, beside, text: value });
     else if (flag === "--image") {
       const data = readFileSync(value), image = createHash("sha256").update(data).digest("hex");
-      images.set(image, { file: value, data }); criteria.push({ window, control, image });
-    } else if (flag === "--window") { window = value; control = undefined; }
-    else if (flag === "--control") { if (!window) die("wait: --control needs a --window before it"); control = value; }
-    else window = control = undefined; // --screen
-    unused = flag === "--text" || flag === "--image" ? undefined : flag;
+      images.set(image, { file: value, data }); criteria.push({ window, control, beside, image });
+    } else if (flag === "--beside") { if (!control) die("wait: --beside needs a --control before it"); beside = value; }
+    else {
+      flush();
+      if (flag === "--window") { window = value; control = beside = undefined; }
+      else if (flag === "--control") { if (!window) die("wait: --control needs a --window before it"); control = value; beside = undefined; }
+      else window = control = beside = undefined; // --screen
+    }
+    unused = flag === "--text" || flag === "--image" ? undefined : flag === "--beside" ? "--control" : flag;
   }
+  flush();
   if (unused) die(`wait: no --text or --image after ${unused}; put --window/--control/--screen before the criteria they apply to`);
-  if (!criteria.length) die("wait: give at least one --text <string> or --image <file>");
+  if (!criteria.length) die("wait: give at least one --text <string>, --image <file> or --control <name|id>");
   return { criteria, images };
 }
 async function runWait() {
@@ -401,7 +414,9 @@ async function runWait() {
   const { criteria, images } = waitCriteria();
   const number = (name, fallback, max = Infinity) => { const v = Number(flags[name] ?? fallback); if (!(v >= 0 && v <= max)) die(`wait: bad --${name} '${flags[name]}'`); return v; };
   const timeout = number("timeout", 60), interval = number("interval", 500), tolerance = number("tolerance", 10, 255);
-  const start = Date.now(), check = () => rpc("check", { criteria, tolerance });
+  const since = flags.gone || criteria.some((c) => c.beside || (!c.image && c.text === undefined)) ? BESIDE_VERSION : 0;
+  const start = Date.now(), check = () => rpc("check", { criteria, tolerance }, since);
+  const there = (x) => x.matches.length > 0, wanted = (x) => (flags.gone ? !there(x) && !x.failed : there(x));
   for (;;) {
     let r = await check();
     if (r.missing.length) { // images the machine does not have yet
@@ -409,16 +424,18 @@ async function runWait() {
       r = await check();
       if (r.missing.length) die("error: the agent did not keep the image");
     }
-    const elapsed = (Date.now() - start) / 1000, matched = r.results.every((x) => x.matches.length);
-    if (matched) { // one array entry per place found
+    const elapsed = (Date.now() - start) / 1000;
+    if (r.results.every(wanted)) { // one array entry per place found; with --gone there is none
+      if (flags.gone) return print([]);
       return print(r.results.flatMap((x, i) => { const { image, ...q } = criteria[i];
         return x.matches.map((m) => ({ ...(image && { image: images.get(image).file }), ...q, ...m,
           center: { x: m.rect.x + (m.rect.w >> 1), y: m.rect.y + (m.rect.h >> 1) } })); }));
     }
     if (elapsed >= timeout) {
-      const missing = r.results.flatMap((x, i) => { const q = criteria[i]; return x.matches.length ? [] :
-        [`${q.image ? `image ${images.get(q.image).file}` : `text "${q.text}"`}${q.window ? ` in window "${q.window}"` : ""}${x.reason ? ` (${x.reason})` : ""}`]; });
-      print([]); console.error(`wait: not found after ${elapsed.toFixed(1)} s: ${missing.join("; ")}`);
+      const missing = r.results.flatMap((x, i) => { const q = criteria[i]; if (wanted(x)) return [];
+        const what = q.image ? `image ${images.get(q.image).file}` : q.text !== undefined ? `text "${q.text}"` : `control "${q.control}"${q.beside ? ` beside "${q.beside}"` : ""}`;
+        return [`${what}${q.window ? ` in window "${q.window}"` : ""}${x.reason ? ` (${x.reason})` : ""}`]; });
+      print([]); console.error(`wait: ${flags.gone ? "still there" : "not found"} after ${elapsed.toFixed(1)} s: ${missing.join("; ")}`);
       process.exitCode = 124; return;
     }
     await new Promise((res) => setTimeout(res, Math.min(interval, (timeout - elapsed) * 1000)));
@@ -434,10 +451,11 @@ for (let i = 0; i < argv.length; i++) {
   const f = argv[i] === "-p" ? "--profile" : argv[i];
   if (pos[0] === "wait") {
     if (f === "--screen") { waitArgs.push([f]); continue; }
-    if (["--window", "--control", "--text", "--image"].includes(f)) { waitArgs.push([f, argv[++i]]); continue; }
+    if (f === "--gone") { flags.gone = true; continue; }
+    if (["--window", "--control", "--beside", "--text", "--image"].includes(f)) { waitArgs.push([f, argv[++i]]); continue; }
     if (["--interval", "--tolerance"].includes(f)) { flags[f.slice(2)] = argv[++i]; continue; }
   }
-  if (VALUE_FLAGS.includes(f) || (["profile", "install", "upgrade"].includes(pos[0]) && PROFILE_FLAGS.includes(f))) flags[f.slice(2)] = argv[++i];
+  if (VALUE_FLAGS.includes(f) || (pos[0] === "click" && f === "--beside") || (["profile", "install", "upgrade"].includes(pos[0]) && PROFILE_FLAGS.includes(f))) flags[f.slice(2)] = argv[++i];
   else pos.push(argv[i]);
 }
 const [cmd, ...a] = pos;
@@ -503,7 +521,10 @@ switch (cmd) {
   case "tree": print(await rpc("tree", { window: a[0], depth: a[1] })); break;
   case "find": print(await rpc("find", { window: a[0], query: a[1] })); break;
   case "focus": print(await rpc("focus", { window: a[0] })); break;
-  case "click": print(await rpc("invoke", { window: a[0], name: a[1] })); break;
+  case "click": {
+    if ("beside" in flags && !flags.beside) die("click: --beside needs a text"); // never fall back to the first match
+    print(await rpc("invoke", { window: a[0], name: a[1], beside: flags.beside }, flags.beside ? BESIDE_VERSION : 0)); break;
+  }
   case "settext": print(await rpc("settext", { window: a[0], text: a.slice(1).join(" "), name: flags.control })); break;
   case "gettext": print(await rpc("gettext", { window: a[0], name: flags.control })); break;
   case "type": print(await rpc("type", { text: a.join(" "), window: flags.window })); break;
