@@ -16,11 +16,12 @@ you / agent --> CLI (Mac) --HTTP--> SSH tunnel --> agent.ps1 (inside your RDP se
   it later using the existing connection. Neither ever happens implicitly.
 - **It acts in the session you are looking at.** Whatever you see in your RDP window is what the tool sees and drives.
 
-There are two ways to connect, chosen per profile:
+How the CLI talks to a machine is a per-profile setting, `transport`, set with `profile add --transport ssh|https`.
+If omitted it is `https` when you give `--vm` and `ssh` otherwise; it is always stored and shown by `profile list`.
 
-| | SSH profile (`--host`) | Azure profile (`--vm`) |
+| | `--transport ssh` (needs `--host`) | `--transport https` (`--vm` for Azure, or `--host` for any machine) |
 |---|---|---|
-| Install / upgrade | `ssh` + `scp` | `az vm run-command` (no SSH, no open port needed to install) |
+| Install / upgrade | `ssh` + `scp` | `az vm run-command`, or by hand (`install --manual`) |
 | Traffic | HTTP through an SSH tunnel to the agent's loopback port | HTTPS straight to the agent, **mutual TLS** |
 | Authentication | SSH key, then a per-start token | client certificate |
 | Network exposure | none beyond SSH | the agent port must be reachable from you (see below) |
@@ -29,9 +30,9 @@ There are two ways to connect, chosen per profile:
 
 | Where | What |
 |---|---|
-| Mac (or any Unix) | Node 18+, and `ssh` / `scp` on the PATH. No npm dependencies. |
-| Windows VM | Windows 10/11 with PowerShell 5.1 (built in) and the OpenSSH server running. |
-| Access | SSH to the VM with a private key (`BatchMode`, so no password prompts). |
+| Mac (or any Unix) | Node 18+, no npm dependencies. `ssh` / `scp` for the ssh transport; `openssl` for https (plus `az` for Azure VMs). |
+| Windows VM | Windows 10/11 with PowerShell 5.1 (built in) plus the OpenSSH server for the ssh transport. |
+| Access | ssh transport: SSH with a private key (`BatchMode`, so no password prompts). https: see *HTTPS transport*. |
 | Session | Someone **logged in over RDP** (the agent needs an interactive desktop to live in). |
 
 ## Quick start
@@ -90,6 +91,22 @@ Every other command only **checks**: if no agent answers it stops with `The agen
 Install and upgrade both use SSH, and the agent never updates itself, so a broken agent can always be replaced. When you
 change `agent/agent.ps1`, bump `$Version` there and `AGENT_VERSION` in `cli/cli.mjs` together.
 
+#### Choosing the install method: `--ssh` / `--az`
+
+| Command | Installs by | Profile transport afterwards |
+|---|---|---|
+| `install` | the profile's current transport | unchanged |
+| `install --ssh` | `ssh` + `scp` | `ssh` (loopback agent behind an SSH tunnel) |
+| `install --az` | `az vm run-command` | `https` (mutual TLS) |
+| `install --manual` | you, with the generated files | `https` (mutual TLS) |
+
+The profile is updated only after the install succeeds, and keeps the settings of both methods. Missing details are
+worked out: `--az` on an SSH profile finds the Azure VM that owns its host name or IP; `--ssh` on an HTTPS profile takes the
+DNS name and user from Azure (pass `--key` if the default `~/.ssh/id_ed25519` is wrong). `--vm`, `--resource-group`,
+`--host`, `--key`, `--agent-port` and `--connect` override them. If the agent already answers over the requested method,
+nothing is reinstalled: a different method just switches the profile, the current one is refused (use `upgrade`).
+`upgrade` always uses the profile's transport.
+
 ### What lives on the VM
 
 In `C:\Users\<user>\Downloads\windows-session-ctl\`:
@@ -114,7 +131,7 @@ Run `node cli/cli.mjs` with no arguments (or `help`) for the built-in usage text
 | `profile add <name> --host H [--user U] [--key K] [--port P]` | Save a target machine (stored in `~/.config/windows-session-ctl/config.json`). Re-running with the same name updates it. The local tunnel port is assigned automatically (8766, 8767, …) unless you pass `--port`. |
 | `profile list` (alias `profiles`) / `profile rm <name>` | List profiles / remove one (closes its tunnel and deletes its cached token). |
 | `--profile <name>` / `-p <name>` | Run any command against that profile. A unique name prefix is enough. Also `$WINSESSION_PROFILE`. |
-| `install` | First install of the agent on the VM (see *Install and upgrade*). |
+| `install [--ssh\|--az]` | First install of the agent on the VM (see *Install and upgrade*). |
 | `upgrade [--force]` | Replace the agent with this CLI's version, through the existing connection. |
 | `up` / `down` | Open / close the SSH tunnel. Other commands open it on demand. |
 | `status` | `{host, tunnel, agent, version, session, screen, user}`. Only reports; it never installs or changes anything. |
@@ -262,15 +279,19 @@ bypasses profiles for that command, which is handy in scripts and CI.
 One profile is one machine and one user. Driving two different users on the same VM is not supported: the agent uses a
 fixed port and install folder per user, and the logon task runs for one user.
 
-## Azure profiles (no SSH, mutual TLS)
+## HTTPS transport (no SSH, mutual TLS)
 
 ```bash
 az login                                            # subscription that holds the VM
-windows-session-ctl profile add win11az --vm win11-test        # resource group, DNS name and user are discovered
+windows-session-ctl profile add win11az --transport https --vm win11-test  # resource group, DNS name and user are discovered
 windows-session-ctl -p win11az install                         # via az vm run-command; takes about a minute
 windows-session-ctl -p win11az windows
 windows-session-ctl -p win11az upgrade                         # later, also via run-command
 ```
+
+An `https` profile is either an Azure VM (`--vm`, installed with `az vm run-command`) or any other Windows machine
+(`--host <dns-name-or-ip>`, installed by hand: see *Manual install*). Flags that
+belong to the other transport are rejected. To switch a profile, run `profile add` again with the same name.
 
 Options for `profile add`: `--resource-group RG` (needed only if the VM name is ambiguous), `--user U` (desktop user,
 default the VM's admin user), `--agent-port P` (default 8443), `--connect host:port` (see *Reachability*).
@@ -278,7 +299,7 @@ default the VM's admin user), `--agent-port P` (default 8443), `--connect host:p
 Needs: Azure CLI logged in with permission to run commands on the VM, `openssl` locally, a **running** Windows VM whose
 public IP has a DNS name, and someone logged in on its desktop.
 
-### What `install` does
+### What the Azure install does (`install --az`)
 
 1. Looks up the VM by name (resource group, DNS name, admin user, power state).
 2. Creates a local CA and client certificate on first use (`~/.config/windows-session-ctl/pki/`).
@@ -292,6 +313,42 @@ Only public material travels through run-command. The server key never leaves th
 your machine. The CA is **not** added to the VM's trusted roots: the agent itself accepts only client certificates that
 chain to the `ca.crt` in its folder and carry the client-authentication usage. The CLI trusts only that CA for the server
 and checks the DNS name.
+
+### Manual install (any Windows machine, no SSH, no Azure)
+
+```bash
+windows-session-ctl profile add office --transport https --host pc.example.com     # name or IP the CLI will connect to
+windows-session-ctl -p office install --manual                                    # writes tmp/windows-session-ctl-office-install/
+```
+
+The folder (under `tmp/` in the current directory, or `--out DIR`) contains:
+
+| File | What it is |
+|---|---|
+| `agent.ps1` | the agent |
+| `ca.crt` | the CA the agent will accept client certificates from |
+| `server.pfx` | the machine's TLS certificate **and private key**, password protected |
+| `install.ps1` | the install script (contains that password) |
+
+Copy the folder to the Windows machine any way you like, and there, in an **elevated** PowerShell inside it:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1            # add -User <name> if the desktop user is someone else
+```
+
+The script copies the agent to that user's `Downloads\windows-session-ctl`, imports the certificate, binds the port, opens
+the Windows firewall, registers and starts the logon task, and deletes `server.pfx`. Then check with
+`windows-session-ctl -p office status`.
+
+- The certificate is issued for the profile's `--host` (a DNS name or an IP address); connect by that same value. To change
+  it, run `install --manual --host <new> --force`.
+- **The package holds a private key.** Unlike the Azure install (where the key is created on the machine and never leaves
+  it), there is no channel to fetch a signing request, so the key is generated on your computer. Move the folder over a
+  channel you trust and delete your copy; `tmp/` is ignored by git in this repository.
+- `--user` on `profile add` or `install --manual` pre-fills the script's `-User`. The user must be a local account whose
+  profile folder is `C:\Users\<name>`.
+- Upgrade the same way: `upgrade --manual` writes `agent.ps1` and `upgrade.ps1`; run the latter elevated. The CLI warns
+  when the machine's agent is older than itself.
 
 ### Reachability
 
@@ -312,7 +369,7 @@ windows-session-ctl profile add win11az --vm win11-test --connect 127.0.0.1:1844
 | File (in `~/.config/windows-session-ctl/pki/`) | Lifetime | Notes |
 |---|---|---|
 | `ca.crt` / `ca.key` | 10 years | signs everything; keep `ca.key` private. Anyone holding it can control your VMs' agents. |
-| `client.crt` / `client.key` | 825 days | your identity to every Azure-profile agent. Delete both and run `install` to renew. |
+| `client.crt` / `client.key` | 825 days | your identity to every `https`-profile agent. Delete both and run `install` to renew. |
 | server certificate (on the VM) | 730 days | renew by running `install` again (stop the agent's task first, or it reports "already installed"). |
 
 There is no revocation: to cut off a lost client key, delete the whole `pki/` folder and reinstall each VM. Another
@@ -327,7 +384,7 @@ computer needs its own copy of `pki/` (or its own CA and a reinstall, which repl
 
 ## Security
 
-- Azure profiles expose the agent on the network (as far as your NSG and firewall allow). Client-certificate
+- `https` profiles expose the agent on the network (as far as your NSG and firewall allow). Client-certificate
   authentication is then the only gate, so limit who can reach the port and protect `pki/`.
 
 - The agent can read and click anything in the session, and run commands, with the privileges of the VM user (the task
@@ -355,6 +412,11 @@ Other known limits: the Windows key cannot be sent, `type` is limited to what Se
 so prefer `settext`), and only the session of the task's user is driven. UIA trees of some apps are huge, so use `find`
 or a small `depth` instead of dumping everything.
 
+## Sample infrastructure
+
+[`doc/terraform/`](doc/terraform/README.md) is a self-contained Terraform example that creates an Azure Windows 11 VM
+ready for this tool (RDP, OpenSSH, DNS name). Replace the `yourorg` placeholder and subscription ID.
+
 ## Layout
 
 ```
@@ -364,4 +426,5 @@ cli/azure.mjs            find a VM and run PowerShell on it with `az vm run-comm
 cli/vm-scripts.mjs       the PowerShell that Azure install / upgrade runs on the VM
 cli/pki.mjs              local CA, client certificate, server certificate signing
 doc/windows-session-ctl   example global wrapper for ~/bin
+doc/terraform/            sample Terraform for an Azure Windows VM
 ```

@@ -28,6 +28,14 @@ export function findVm(name, rg) {
   };
 }
 
+// Find the VM that owns a DNS name or public IP (used when an ssh profile only knows its host).
+export function findVmByHost(host) {
+  const hit = (az(["vm", "list", "-d"]) || []).filter((v) => [v.fqdns, v.publicIps].some((x) => (x || "").toLowerCase().split(",").includes(host.toLowerCase())));
+  if (hit.length === 1) return { name: hit[0].name, rg: hit[0].resourceGroup };
+  const sub = az(["account", "show", "--query", "name"]);
+  throw new Error(`No single VM with DNS name or IP '${host}' in Azure subscription '${sub}'. Pass --vm <name>.`);
+}
+
 // Run a PowerShell script on the VM as SYSTEM (session 0). Returns the script's stdout; throws with stderr on failure.
 export function runPowerShell(rg, vm, script, timeoutMs = 600000) {
   const dir = mkdtempSync(join(tmpdir(), "wsc-az-")); const file = join(dir, "script.ps1");

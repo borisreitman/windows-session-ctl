@@ -5,13 +5,14 @@ import { existsSync, mkdirSync, writeFileSync, readFileSync, chmodSync, rmSync }
 import { homedir, hostname } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
+import { isIP } from "node:net";
 
 export const PKI_DIR = join(homedir(), ".config", "windows-session-ctl", "pki");
 export const CA_CRT = join(PKI_DIR, "ca.crt"), CLIENT_CRT = join(PKI_DIR, "client.crt"), CLIENT_KEY = join(PKI_DIR, "client.key");
 const CA_KEY = join(PKI_DIR, "ca.key");
 
-function openssl(args, input) {
-  const r = spawnSync("openssl", args, { encoding: "utf8", input });
+function openssl(args, env) {
+  const r = spawnSync("openssl", args, { encoding: "utf8", env: { ...process.env, ...env } });
   if (r.error) throw new Error("openssl not found on PATH");
   if (r.status !== 0) throw new Error(`openssl ${args[0]} failed: ${(r.stderr || "").trim()}`);
   return r.stdout;
@@ -40,11 +41,27 @@ export function ensurePki() {
 export const caPem = () => readFileSync(CA_CRT, "utf8");
 
 // Sign the CSR produced on the VM as a TLS server certificate for `fqdn` (CSR subject/extensions are ignored).
-export function signServerCsr(csrPem, fqdn) {
-  if (!/^[A-Za-z0-9.-]+$/.test(fqdn)) throw new Error(`refusing to issue a certificate for '${fqdn}'`);
+export function signServerCsr(csrPem, host) {
+  if (!isIP(host) && !/^[A-Za-z0-9.-]+$/.test(host)) throw new Error(`refusing to issue a certificate for '${host}'`);
   const dir = PKI_DIR, csr = join(dir, "server.csr"), ext = join(dir, "server.ext"), out = join(dir, "server.crt");
   writeFileSync(csr, csrPem);
-  writeFileSync(ext, `basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:${fqdn}\n`);
+  writeFileSync(ext, `basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\nsubjectAltName=${isIP(host) ? "IP" : "DNS"}:${host}\n`);
   openssl(["x509", "-req", "-in", csr, "-CA", CA_CRT, "-CAkey", CA_KEY, "-set_serial", serial(), "-days", "730", "-sha256", "-extfile", ext, "-out", out]);
   const pem = readFileSync(out, "utf8"); rmSync(csr, { force: true }); rmSync(out, { force: true }); return pem;
+}
+
+// Manual install: there is no channel to fetch a signing request, so the server key is made here and shipped as a
+// password-protected PKCS#12 file (the install script imports it and deletes it).
+export function createServerPfx(host, outFile) {
+  ensurePki();
+  const key = join(PKI_DIR, "server-manual.key"), csr = join(PKI_DIR, "server-manual.csr"), crt = join(PKI_DIR, "server-manual.crt");
+  const password = randomBytes(18).toString("base64url");
+  try {
+    openssl(["ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", key]); priv(key);
+    openssl(["req", "-new", "-key", key, "-subj", "/CN=windows-session-ctl agent", "-out", csr]);
+    writeFileSync(crt, signServerCsr(readFileSync(csr, "utf8"), host));
+    openssl(["pkcs12", "-export", "-inkey", key, "-in", crt, "-name", "windows-session-ctl agent", "-out", outFile, "-passout", "env:WSC_PFX_PASSWORD"], { WSC_PFX_PASSWORD: password });
+    priv(outFile);
+  } finally { for (const f of [key, csr, crt]) rmSync(f, { force: true }); }
+  return password;
 }

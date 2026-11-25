@@ -1,3 +1,12 @@
 node_modules
 *.png
 .DS_Store
+# manual install packages (tmp/ by default) contain a private key
+tmp/
+windows-session-ctl-*-install/
+windows-session-ctl-*-upgrade/
+*.pfx
+# terraform sample
+doc/terraform/.terraform/
+doc/terraform/terraform.tfvars
+doc/terraform/*.tfstate*
