@@ -461,7 +461,8 @@ stored in that profile can be omitted, so repeating the install is just `windows
 | `--key K` | no (SSH tunnel only) | `~/.ssh/id_ed25519` |
 | `--out DIR` | no (never stored) | `tmp/windows-session-ctl-<name>-install` |
 
-The folder (under `tmp/` in the current directory, or `--out DIR`) contains:
+The package is written to its own subfolder, `tmp/windows-session-ctl-<name>-install/` in the current directory (or to
+`--out DIR`). That folder contains:
 
 | File | What it is |
 |---|---|
