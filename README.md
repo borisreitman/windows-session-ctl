@@ -27,6 +27,14 @@ otherwise; it is always stored and shown by `profile list`.
 | Authentication | SSH key, then a per-start token | client certificate |
 | Network exposure | none beyond SSH | the agent port must be reachable from you (see below) |
 
+## License
+
+This project is **[GNU GPL v3](LICENSE) or later**.
+
+It can read and act on whatever is in the Windows session where you install it, and run commands there. The GPL keeps
+distributed changes open, so you can always inspect the code that drives your desktop. The agent is shipped as a plain
+PowerShell script — do not minify or obfuscate it.
+
 ## Requirements
 
 | Where | What |

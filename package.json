@@ -2,6 +2,7 @@
   "name": "windows-session-ctl",
   "version": "0.1.0",
   "private": true,
+  "license": "GPL-3.0-or-later",
   "type": "module",
   "description": "Drive a Windows desktop session (the one you are logged into, over RDP or at the console) from the shell",
   "bin": { "windows-session-ctl": "./cli/cli.mjs" },
