@@ -16,6 +16,15 @@ you / agent --> CLI (Mac) --HTTP--> SSH tunnel --> agent.ps1 (inside your RDP se
   it later using the existing connection. Neither ever happens implicitly.
 - **It acts in the session you are looking at.** Whatever you see in your RDP window is what the tool sees and drives.
 
+There are two ways to connect, chosen per profile:
+
+| | SSH profile (`--host`) | Azure profile (`--vm`) |
+|---|---|---|
+| Install / upgrade | `ssh` + `scp` | `az vm run-command` (no SSH, no open port needed to install) |
+| Traffic | HTTP through an SSH tunnel to the agent's loopback port | HTTPS straight to the agent, **mutual TLS** |
+| Authentication | SSH key, then a per-start token | client certificate |
+| Network exposure | none beyond SSH | the agent port must be reachable from you (see below) |
+
 ## Requirements
 
 | Where | What |
@@ -253,7 +262,73 @@ bypasses profiles for that command, which is handy in scripts and CI.
 One profile is one machine and one user. Driving two different users on the same VM is not supported: the agent uses a
 fixed port and install folder per user, and the logon task runs for one user.
 
+## Azure profiles (no SSH, mutual TLS)
+
+```bash
+az login                                            # subscription that holds the VM
+windows-session-ctl profile add win11az --vm win11-test        # resource group, DNS name and user are discovered
+windows-session-ctl -p win11az install                         # via az vm run-command; takes about a minute
+windows-session-ctl -p win11az windows
+windows-session-ctl -p win11az upgrade                         # later, also via run-command
+```
+
+Options for `profile add`: `--resource-group RG` (needed only if the VM name is ambiguous), `--user U` (desktop user,
+default the VM's admin user), `--agent-port P` (default 8443), `--connect host:port` (see *Reachability*).
+
+Needs: Azure CLI logged in with permission to run commands on the VM, `openssl` locally, a **running** Windows VM whose
+public IP has a DNS name, and someone logged in on its desktop.
+
+### What `install` does
+
+1. Looks up the VM by name (resource group, DNS name, admin user, power state).
+2. Creates a local CA and client certificate on first use (`~/.config/windows-session-ctl/pki/`).
+3. On the VM, creates the server key (machine store, non-exportable) and returns a signing request.
+4. Signs it locally for the VM's DNS name.
+5. On the VM: stores the certificate and links it to the key, binds it to the port with client-certificate negotiation,
+   adds a **Windows Firewall** rule for the port, writes `agent.ps1`, `ca.crt` and `tls.port`, and registers and starts
+   the logon task.
+
+Only public material travels through run-command. The server key never leaves the VM; the CA and client keys never leave
+your machine. The CA is **not** added to the VM's trusted roots: the agent itself accepts only client certificates that
+chain to the `ca.crt` in its folder and carry the client-authentication usage. The CLI trusts only that CA for the server
+and checks the DNS name.
+
+### Reachability
+
+**The tool never creates or changes an Azure Network Security Group.** After install, your machine must be able to reach
+`<dns-name>:<agent-port>` by a route you provide: an NSG rule you manage (for example in Terraform), a VPN or mesh
+network, or a tunnel. If it cannot, `install` says so and the agent is still installed. To go through a tunnel or private
+address, use `--connect host:port`; the certificate is still verified against the DNS name:
+
+```bash
+ssh -N -L 18443:127.0.0.1:8443 azureuser@<vm> &       # example tunnel, if you have SSH after all
+windows-session-ctl profile add win11az --vm win11-test --connect 127.0.0.1:18443
+```
+
+`upgrade` needs a working connection (it checks the running version first); `install` does not.
+
+### Certificates
+
+| File (in `~/.config/windows-session-ctl/pki/`) | Lifetime | Notes |
+|---|---|---|
+| `ca.crt` / `ca.key` | 10 years | signs everything; keep `ca.key` private. Anyone holding it can control your VMs' agents. |
+| `client.crt` / `client.key` | 825 days | your identity to every Azure-profile agent. Delete both and run `install` to renew. |
+| server certificate (on the VM) | 730 days | renew by running `install` again (stop the agent's task first, or it reports "already installed"). |
+
+There is no revocation: to cut off a lost client key, delete the whole `pki/` folder and reinstall each VM. Another
+computer needs its own copy of `pki/` (or its own CA and a reinstall, which replaces the trusted CA on that VM).
+
+### Removing it from a VM
+
+`profile rm` only forgets the profile locally. On the VM (elevated): `schtasks /Delete /TN windows-agent /F`,
+`netsh http delete sslcert ipport=0.0.0.0:8443`, `netsh http delete urlacl url=https://+:8443/`,
+`netsh advfirewall firewall delete rule name="windows-session-ctl agent"`, delete the certificate issued by
+`windows-session-ctl CA` from `Cert:\LocalMachine\My`, and delete the folder under Downloads.
+
 ## Security
+
+- Azure profiles expose the agent on the network (as far as your NSG and firewall allow). Client-certificate
+  authentication is then the only gate, so limit who can reach the port and protect `pki/`.
 
 - The agent can read and click anything in the session, and run commands, with the privileges of the VM user (the task
   runs elevated). Treat access to it like access to the logged-in desktop.
@@ -283,7 +358,10 @@ or a small `depth` instead of dumping everything.
 ## Layout
 
 ```
-agent/agent.ps1          the in-session agent (UIA, SendInput, exec/psexec, screenshots, HTTP server)
+agent/agent.ps1          the in-session agent (UIA, SendInput, exec/psexec, screenshots, HTTP + mTLS server)
 cli/cli.mjs              the CLI (profiles, tunnel, install/upgrade, commands)
+cli/azure.mjs            find a VM and run PowerShell on it with `az vm run-command`
+cli/vm-scripts.mjs       the PowerShell that Azure install / upgrade runs on the VM
+cli/pki.mjs              local CA, client certificate, server certificate signing
 doc/windows-session-ctl   example global wrapper for ~/bin
 ```

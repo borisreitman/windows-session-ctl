@@ -1,8 +1,13 @@
 #!/usr/bin/env node
 // windows-session-ctl: drive the Windows desktop session a user is logged into (RDP or console), over SSH.
-//   Mac CLI --HTTP--> ssh tunnel (127.0.0.1:LOCAL) --> agent.ps1 inside the RDP session --> UI Automation / SendInput
+//   ssh profile:   CLI --HTTP+token--> ssh tunnel (127.0.0.1:LOCAL) --> agent.ps1 in the desktop session
+//   azure profile: CLI --HTTPS, mutual TLS--> agent.ps1   (installed through `az vm run-command`, no SSH)
 import { spawnSync, spawn } from "node:child_process";
 import net from "node:net";
+import https from "node:https";
+import { ensurePki, signServerCsr, caPem, CA_CRT, CLIENT_CRT, CLIENT_KEY } from "./pki.mjs";
+import { findVm, runPowerShell } from "./azure.mjs";
+import { csrScript, installScript, upgradeScript } from "./vm-scripts.mjs";
 import { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
@@ -13,15 +18,17 @@ const CFG_DIR = join(homedir(), ".config", "windows-session-ctl");
 const CFG_FILE = join(CFG_DIR, "config.json");
 const TOKEN_DIR = join(CFG_DIR, "tokens");
 const AGENT_PORT = 8766;
+const DEFAULT_TLS_PORT = 8443;
 const rdir = (t) => `C:\\Users\\${t.user}\\Downloads\\windows-session-ctl`; // install dir on the VM
-const AGENT_VERSION = 6; // keep in step with $Version in agent/agent.ps1
+const AGENT_VERSION = 8; // keep in step with $Version in agent/agent.ps1
 
 const USAGE = `Drive the Windows desktop session a user is logged into (RDP or console), over SSH.
 
   windows-session-ctl profile add <name> --host H [--user U] [--key K] [--port P]   save a target machine
+  windows-session-ctl profile add <name> --vm <azure-vm> [--resource-group RG] [--agent-port P] [--connect host:port]   Azure VM, direct mTLS (no SSH)
   windows-session-ctl profile list | rm <name>      (alias: profiles)
   windows-session-ctl --profile <name> <command>    pick a profile (-p, or $WINSESSION_PROFILE); optional when only one exists
-  windows-session-ctl install            first install of the agent on the VM (copy, register logon task, start); never automatic
+  windows-session-ctl install            (Azure profiles: via az run-command + mutual TLS) first install of the agent on the VM (copy, register logon task, start); never automatic
   windows-session-ctl upgrade [--force]  replace the agent of a working connection with this CLI's version (no-op if current)
   windows-session-ctl up | down          open / close the SSH tunnel (other commands open it on demand)
   windows-session-ctl status             tunnel, agent, session, screen size
@@ -50,6 +57,7 @@ Profile: --profile/-p, $WINSESSION_PROFILE, or the only profile if there is just
 Ad hoc: WINSESSION_HOST (+ _USER, _KEY, _PORT) bypasses profiles. Prefer \`tree\`/\`find\`/\`click\` over screenshots.`;
 
 const die = (m) => { console.error(m); process.exit(1); };
+process.on("uncaughtException", (e) => die(`error: ${e.message}`));
 const DEFAULT_USER = "azureuser", DEFAULT_KEY = join(homedir(), ".ssh", "id_ed25519");
 function loadCfg() {
   let c = existsSync(CFG_FILE) ? JSON.parse(readFileSync(CFG_FILE, "utf8")) : {};
@@ -63,7 +71,8 @@ function loadCfg() {
 }
 function saveCfg(c) { mkdirSync(CFG_DIR, { recursive: true }); writeFileSync(CFG_FILE, JSON.stringify(c, null, 2) + "\n"); }
 function makeTarget(name, p) {
-  return { name, host: p.host, user: p.user || DEFAULT_USER, key: p.key || DEFAULT_KEY, port: Number(p.port || AGENT_PORT) };
+  if (p.vm) return { name, transport: "azure", vm: p.vm, rg: p.resourceGroup, user: p.user, fqdn: p.fqdn, agentPort: Number(p.agentPort || DEFAULT_TLS_PORT), connect: p.connect };
+  return { transport: "ssh", name, host: p.host, user: p.user || DEFAULT_USER, key: p.key || DEFAULT_KEY, port: Number(p.port || AGENT_PORT) };
 }
 function target() {
   if (process.env.WINSESSION_HOST) { // ad hoc target, no profile
@@ -89,7 +98,23 @@ function ssh(t, remote) {
   return { code: r.status, out: (r.stdout || "").trim(), err: (r.stderr || "").trim() };
 }
 
+function httpsCall(t, method, params) { // mutual TLS: we present our client cert and trust only our CA, for the VM's DNS name
+  return new Promise((resolve, reject) => {
+    if (!t.fqdn) return reject(new Error("no DNS name known; run install"));
+    const [h, pt] = t.connect ? t.connect.split(":") : [t.fqdn, t.agentPort];
+    const body = JSON.stringify({ method, params });
+    const req = https.request({ agent: false, host: h, port: Number(pt), servername: t.fqdn, path: "/command", method: "POST", // agent:false: a pooled socket would be dead after an agent restart
+      ca: readFileSync(CA_CRT), cert: readFileSync(CLIENT_CRT), key: readFileSync(CLIENT_KEY), minVersion: "TLSv1.2",
+      headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) } }, (res) => {
+      const ch = []; res.on("data", (d) => ch.push(d));
+      res.on("end", () => { try { resolve({ status: res.statusCode, body: JSON.parse(Buffer.concat(ch).toString("utf8")) }); } catch (e) { reject(e); } });
+    });
+    req.setTimeout(method === "ping" ? 10000 : 900000, () => req.destroy(new Error("timeout")));
+    req.on("error", reject); req.end(body);
+  });
+}
 async function call(t, method, params = {}, tok) {
+  if (t.transport === "azure") return httpsCall(t, method, params);
   const res = await fetch(`http://127.0.0.1:${t.port}/command`, {
     method: "POST", headers: { "X-Token": tok, "content-type": "application/json" },
     body: JSON.stringify({ method, params }),
@@ -98,6 +123,7 @@ async function call(t, method, params = {}, tok) {
 }
 async function alive(t) { return new Promise((res) => { const s = net.connect(t.port, "127.0.0.1"); s.setTimeout(1500); s.on("connect", () => { s.destroy(); res(true); }); s.on("error", () => res(false)); s.on("timeout", () => { s.destroy(); res(false); }); }); }
 async function up(t) {
+  if (t.transport === "azure") return; // direct connection, no tunnel
   if (await alive(t)) return;
   const p = spawn("ssh", [...sshBase(t), "-N", "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=30",
     "-L", `${t.port}:127.0.0.1:${AGENT_PORT}`, `${t.user}@${t.host}`], { detached: true, stdio: "ignore" });
@@ -131,6 +157,7 @@ async function installAgent(t) {
 }
 let checked = false;
 async function tryCall(t, method, params) {
+  if (t.transport === "azure") return call(t, method, params).catch(() => null);
   let tok = existsSync(tokenFile(t)) ? readFileSync(tokenFile(t), "utf8") : "";
   let r = tok ? await call(t, method, params, tok).catch(() => null) : null;
   if (!r || r.status === 401) { // stale token or agent restarted: re-read it from the VM
@@ -138,6 +165,37 @@ async function tryCall(t, method, params) {
     if (f.code === 0 && f.out) { storeToken(t, f.out); r = await call(t, method, params, f.out).catch(() => null); }
   }
   return r;
+}
+async function azureSetup(t, upgrade) {
+  const vm = findVm(t.vm, t.rg);
+  if (vm.os && vm.os !== "Windows") die(`'${vm.name}' is not a Windows VM`);
+  if (!/running/i.test(vm.power || "")) die(`VM '${vm.name}' is '${vm.power}'. Start it first (run-command needs a running VM).`);
+  if (!vm.fqdn) die(`The public IP of '${vm.name}' has no DNS name. Give it a DNS label in Azure; the certificate and TLS verification use the name.`);
+  const user = t.user || vm.user;
+  console.error(`Azure VM ${vm.name} (resource group ${vm.rg}) -> ${vm.fqdn}, desktop user ${user}`);
+  const agentB64 = Buffer.from(readFileSync(join(ROOT, "agent", "agent.ps1"))).toString("base64");
+  const run = (script) => { const r = runPowerShell(vm.rg, vm.name, script); return r; };
+  let out;
+  if (upgrade) {
+    console.error("Replacing the agent on the VM through Azure run-command...");
+    out = run(upgradeScript({ user, port: t.agentPort, agentB64 }));
+  } else {
+    ensurePki();
+    console.error("1/3 Creating the agent's server key on the VM (it never leaves the VM)...");
+    const a = run(csrScript(vm.fqdn));
+    const csr = (a.stdout.match(/CSR-BEGIN\s*([\s\S]*?)\s*CSR-END/) || [])[1];
+    if (!csr) die("The VM did not return a certificate request:\n" + [a.stdout, a.stderr].filter(Boolean).join("\n"));
+    console.error("2/3 Signing the certificate with the local CA...");
+    const certB64 = Buffer.from(signServerCsr(csr + "\n", vm.fqdn)).toString("base64");
+    console.error("3/3 Installing certificate, agent, firewall rule and logon task on the VM...");
+    out = run(installScript({ user, port: t.agentPort, agentB64, caB64: Buffer.from(caPem()).toString("base64"), certB64 }));
+  }
+  if (!/AGENT-LOG:/.test(out.stdout)) die("Install on the VM failed:\n" + ([out.stdout, out.stderr].filter(Boolean).join("\n") || "(no output from run-command)"));
+  console.error(out.stdout.match(/AGENT-LOG:.*/)[0]);
+  const c = loadCfg(); const prev = c.profiles[t.name] || {};
+  c.profiles[t.name] = { ...prev, vm: vm.name, resourceGroup: vm.rg, user, fqdn: vm.fqdn, agentPort: t.agentPort };
+  saveCfg(c);
+  return makeTarget(t.name, c.profiles[t.name]);
 }
 async function agentVersion(t) { // null when no agent answers
   await up(t); const p = await tryCall(t, "ping", {});
@@ -149,6 +207,7 @@ async function rpc(method, params = {}) {
   if (!checked) { // never installs or updates by itself: only reports, and points at `install`
     checked = true;
     const p = await tryCall(t, "ping", {});
+    if ((!p || !p.body.ok) && t.transport === "azure") die(`No agent answers on ${t.connect || `${t.fqdn || t.vm}:${t.agentPort}`} (mutual TLS). If it is installed, the port is probably not reachable from here: the tool never changes the NSG, so open TCP ${t.agentPort} to your address yourself or use --connect via a tunnel/VPN. Not installed yet: ${me(t)} install`);
     if (!p || !p.body.ok) die(`The agent is not running on '${t.name}'. Install it first: ${me(t)} install  (needs someone logged in on the VM)`);
     const v = p.body.result.version || 0;
     if (v < AGENT_VERSION) console.error(`warning: the agent on '${t.name}' is version ${v}, this CLI expects ${AGENT_VERSION}. Update it with: ${me(t)} upgrade`);
@@ -176,7 +235,7 @@ const print = (v) => console.log(typeof v === "string" ? v : JSON.stringify(v, n
 // ---- args ----
 const argv = process.argv.slice(2);
 const flags = {}; const pos = [];
-const VALUE_FLAGS = ["--window", "--control", "--timeout", "--profile"], PROFILE_FLAGS = ["--host", "--user", "--key", "--port"];
+const VALUE_FLAGS = ["--window", "--control", "--timeout", "--profile"], PROFILE_FLAGS = ["--host", "--user", "--key", "--port", "--vm", "--resource-group", "--agent-port", "--connect"];
 for (let i = 0; i < argv.length; i++) {
   if (argv[i] === "--force") { flags.force = true; continue; }
   const f = argv[i] === "-p" ? "--profile" : argv[i];
@@ -190,37 +249,49 @@ switch (cmd) {
   case "profile": case "profiles": {
     const c = loadCfg(); const sub = cmd === "profiles" ? "list" : a[0] || "list"; const name = a[1];
     if (sub === "add") {
-      if (!name || !flags.host) die("usage: profile add <name> --host H [--user U] [--key K] [--port P]");
+      if (flags.vm) { // Azure VM, direct mTLS: no SSH, no local tunnel port
+        if (!name) die("usage: profile add <name> --vm <azure-vm-name> [--resource-group RG] [--agent-port P] [--connect host:port]");
+        if (!/^[\w.-]+$/.test(flags.vm)) die("odd VM name");
+        const keep = c.profiles[name]?.vm === flags.vm ? c.profiles[name] : {};
+        c.profiles[name] = { ...keep, vm: flags.vm, ...(flags["resource-group"] && { resourceGroup: flags["resource-group"] }), ...(flags.user && { user: flags.user }),
+          agentPort: Number(flags["agent-port"] || keep.agentPort || DEFAULT_TLS_PORT), ...(flags.connect && { connect: flags.connect }) };
+        if (!flags.connect) delete c.profiles[name].connect;
+        saveCfg(c);
+      } else {
+      if (!name || !flags.host) die("usage: profile add <name> --host H [--user U] [--key K] [--port P]  |  profile add <name> --vm <azure-vm>");
       if (!/^[\w.-]+$/.test(name)) die("profile names may use letters, digits, . _ - only");
-      const used = new Set(Object.entries(c.profiles).filter(([n]) => n !== name).map(([, p]) => Number(p.port)));
+      const used = new Set(Object.entries(c.profiles).filter(([n, p]) => n !== name && !p.vm).map(([, p]) => Number(p.port)));
       let port = Number(flags.port || c.profiles[name]?.port || 0);
       if (!port) { port = AGENT_PORT; while (used.has(port)) port++; }
       if (used.has(port)) die(`local port ${port} is used by another profile`);
       c.profiles[name] = { host: flags.host, user: flags.user || DEFAULT_USER, key: flags.key || DEFAULT_KEY, port };
       saveCfg(c);
+      }
     } else if (sub === "rm") {
       if (!c.profiles[name]) die(`No profile '${name}'`);
       const t = makeTarget(name, c.profiles[name]);
-      spawnSync("pkill", ["-f", `${t.port}:127.0.0.1:${AGENT_PORT} ${t.user}@${t.host}`]);
-      rmSync(tokenFile(t), { force: true }); delete c.profiles[name]; saveCfg(c);
+      if (t.transport === "ssh") { spawnSync("pkill", ["-f", `${t.port}:127.0.0.1:${AGENT_PORT} ${t.user}@${t.host}`]); rmSync(tokenFile(t), { force: true }); }
+      delete c.profiles[name]; saveCfg(c);
     } else if (sub !== "list") die("usage: profile add|list|rm");
-    print(Object.entries(c.profiles).map(([n, p]) => ({ name: n, host: p.host, user: p.user || DEFAULT_USER, key: p.key || DEFAULT_KEY, localPort: p.port })));
+    print(Object.entries(c.profiles).map(([n, p]) => p.vm ? { name: n, transport: "azure", vm: p.vm, resourceGroup: p.resourceGroup, fqdn: p.fqdn, user: p.user, agentPort: p.agentPort, connect: p.connect } : { name: n, transport: "ssh", host: p.host, user: p.user || DEFAULT_USER, key: p.key || DEFAULT_KEY, localPort: p.port }));
     break;
   }
   case "install": { // first install only; an agent that already answers must be upgraded instead
-    const t = target(); const cur = await agentVersion(t);
+    let t = target(); const cur = t.transport === "azure" && !t.fqdn ? null : await agentVersion(t);
     if (cur !== null) die(`The agent is already installed on '${t.name}' (version ${cur}). To update it: ${me(t)} upgrade`);
+    if (t.transport === "azure") { t = await azureSetup(t, false); const v = await agentVersion(t); print({ profile: t.name, installed: v, reachable: v !== null, ...(v === null ? { note: `Installed, but this machine cannot reach ${t.connect || `${t.fqdn}:${t.agentPort}`}. The tool does not change the NSG: open TCP ${t.agentPort} to your address yourself, or set --connect via a tunnel/VPN.` } : {}) }); break; }
     await installAgent(t); print({ profile: t.name, installed: await agentVersion(t) }); break;
   }
   case "upgrade": { // replace the agent of an existing, working connection with this CLI's version
-    const t = target(); const cur = await agentVersion(t);
+    let t = target(); const cur = await agentVersion(t);
     if (cur === null) die(`No agent answers on '${t.name}'. For a first install: ${me(t)} install`);
     if (cur >= AGENT_VERSION && !flags.force) { print({ profile: t.name, version: cur, upgraded: false, reason: "already up to date (use --force to reinstall)" }); break; }
-    await installAgent(t); print({ profile: t.name, from: cur, to: await agentVersion(t), upgraded: true }); break;
+    if (t.transport === "azure") t = await azureSetup(t, true); else await installAgent(t);
+    print({ profile: t.name, from: cur, to: await agentVersion(t), upgraded: true }); break;
   }
-  case "up": await up(target()); console.log("tunnel up"); break;
-  case "down": { const t = target(); spawnSync("pkill", ["-f", `${t.port}:127.0.0.1:${AGENT_PORT} ${t.user}@${t.host}`]); console.log(`tunnel down (${t.name})`); break; }
-  case "status": { const t = target(); const tun = await alive(t); let info = null; if (tun) info = await rpc("info").catch(() => null); print({ profile: t.name, host: t.host, tunnel: tun, agent: !!info, expectedVersion: AGENT_VERSION, upToDate: !!info && (info.version || 0) >= AGENT_VERSION, ...(info || {}) }); break; }
+  case "up": { const t = target(); await up(t); console.log(t.transport === "azure" ? "direct (mTLS) profile: no tunnel needed" : "tunnel up"); break; }
+  case "down": { const t = target(); if (t.transport === "azure") { console.log("direct (mTLS) profile: no tunnel to close"); break; } spawnSync("pkill", ["-f", `${t.port}:127.0.0.1:${AGENT_PORT} ${t.user}@${t.host}`]); console.log(`tunnel down (${t.name})`); break; }
+  case "status": { const t = target(); const tun = t.transport === "azure" ? true : await alive(t); let info = null; if (tun) info = await rpc("info").catch(() => null); print({ profile: t.name, transport: t.transport, host: t.host || t.fqdn, tunnel: t.transport === "azure" ? undefined : tun, agent: !!info, expectedVersion: AGENT_VERSION, upToDate: !!info && (info.version || 0) >= AGENT_VERSION, ...(info || {}) }); break; }
   case "info": print(await rpc("info")); break;
   case "windows": print(await rpc("windows")); break;
   case "tree": print(await rpc("tree", { window: a[0], depth: a[1] })); break;

@@ -1,8 +1,8 @@
 # rdp-session-ctl agent. Runs INSIDE the interactive desktop session (started by a scheduled task with /IT),
 # serves JSON commands on 127.0.0.1:$Port. Reach it from the Mac through an SSH tunnel; never expose it.
-param([int]$Port=8766,[string]$Dir=(Join-Path $env:USERPROFILE 'Downloads\windows-session-ctl'))
+param([int]$Port=8766,[int]$TlsPort=0,[string]$Dir=(Join-Path $env:USERPROFILE 'Downloads\windows-session-ctl'))
 $ErrorActionPreference='Stop'
-$Version=6
+$Version=8
 New-Item -ItemType Directory -Force $Dir | Out-Null
 Add-Type -AssemblyName System.Windows.Forms,System.Drawing,UIAutomationClient,UIAutomationTypes
 Add-Type @'
@@ -103,13 +103,44 @@ $M=@{
               $ms=New-Object IO.MemoryStream; $bmp.Save($ms,[Drawing.Imaging.ImageFormat]::Png); @{png=[Convert]::ToBase64String($ms.ToArray());w=$w;h=$h;x=$x;y=$y} }
 }
 
-$l=New-Object Net.HttpListener; $l.Prefixes.Add("http://127.0.0.1:$Port/"); $l.Start()
-"agent listening on 127.0.0.1:$Port session=$([Diagnostics.Process]::GetCurrentProcess().SessionId)" | Set-Content (Join-Path $Dir 'agent.log')
-while($l.IsListening){
-  $c=$l.GetContext(); $rs=$c.Response; $code=200
+# Listeners: always loopback HTTP + token (reached through SSH). With -TlsPort, also HTTPS on all interfaces that
+# requires a client certificate issued by the CA in ca.crt (mutual TLS); the server certificate is bound to the port by
+# the installer (netsh http add sslcert ... clientcertnegotiation=enable).
+$listeners=@(); $pending=@{}
+$l=New-Object Net.HttpListener; $l.Prefixes.Add("http://127.0.0.1:$Port/"); $l.Start(); $listeners+=@{id=0;l=$l;tls=$false}
+$what="127.0.0.1:$Port"
+$caCert=$null
+# The TLS port is also remembered in tls.port, so reinstalling or upgrading over SSH keeps the mTLS listener.
+$pf=Join-Path $Dir 'tls.port'
+if($TlsPort -le 0 -and (Test-Path $pf) -and (Test-Path (Join-Path $Dir 'ca.crt'))){ $TlsPort=[int](Get-Content $pf -Raw).Trim() }
+if($TlsPort -gt 0){
+  $caCert=New-Object Security.Cryptography.X509Certificates.X509Certificate2 (Join-Path $Dir 'ca.crt')
+  $l2=New-Object Net.HttpListener; $l2.Prefixes.Add("https://+:$TlsPort/"); $l2.Start(); $listeners+=@{id=1;l=$l2;tls=$true}
+  $what+=" and mTLS :$TlsPort"
+}
+function ClientOk($cert){ # chain to the pinned CA, with clientAuth EKU; nothing else is trusted
+  if(-not $cert -or -not $caCert){ return $false }
+  $ch=New-Object Security.Cryptography.X509Certificates.X509Chain
+  $ch.ChainPolicy.RevocationMode='NoCheck'; $ch.ChainPolicy.VerificationFlags='AllowUnknownCertificateAuthority'
+  [void]$ch.ChainPolicy.ExtraStore.Add($caCert)
+  if(-not $ch.Build($cert)){ return $false }
+  foreach($st in $ch.ChainStatus){ if($st.Status -notin 'NoError','UntrustedRoot'){ return $false } }
+  $n=$ch.ChainElements.Count; if($n -lt 2){ return $false }
+  if($ch.ChainElements[$n-1].Certificate.Thumbprint -ne $caCert.Thumbprint){ return $false }
+  $eku=$cert.Extensions | ? { $_ -is [Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension] }
+  return [bool]($eku -and ($eku.EnhancedKeyUsages | ? { $_.Value -eq '1.3.6.1.5.5.7.3.2' }))
+}
+"agent listening on $what session=$([Diagnostics.Process]::GetCurrentProcess().SessionId) version=$Version" | Set-Content (Join-Path $Dir 'agent.log')
+while($true){
+  foreach($x in $listeners){ if(-not $pending.ContainsKey($x.id)){ $pending[$x.id]=$x.l.GetContextAsync() } }
+  $i=[Threading.Tasks.Task]::WaitAny([Threading.Tasks.Task[]]@($listeners | % { $pending[$_.id] }))
+  $x=$listeners[$i]; $c=$pending[$x.id].Result; $pending.Remove($x.id)
+  $rs=$c.Response; $code=200
   try {
-    if($c.Request.Headers['X-Token'] -ne $token){ $code=401; $out=@{ok=$false;error='bad token'} }
-    else {
+    $authed=$false
+    if($x.tls){ try{ $authed=ClientOk $c.Request.GetClientCertificate() }catch{ $authed=$false }; if(-not $authed){ $code=401; $out=@{ok=$false;error='client certificate required'} } }
+    elseif($c.Request.Headers['X-Token'] -eq $token){ $authed=$true } else { $code=401; $out=@{ok=$false;error='bad token'} }
+    if($authed){
       $body=(New-Object IO.StreamReader($c.Request.InputStream,[Text.Encoding]::UTF8)).ReadToEnd()
       $req=$body | ConvertFrom-Json
       if(-not $M.ContainsKey($req.method)){ throw "unknown method '$($req.method)'" }
