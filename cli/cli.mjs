@@ -62,7 +62,7 @@ const USAGE = `Drive the Windows desktop session a user is logged into (RDP or c
   windows-session-ctl mouse scroll <delta> [x y]    120 = one notch up, -120 = down; same resolution guard without x y
   windows-session-ctl screenshot [path] [--window <w> [--control <name|id>]] [--rect x,y,w,h]
         capture the screen, a window, a control or a rectangle (counted from the window's top left with --window)
-  windows-session-ctl wait <criteria> [--gone] [--timeout s] [--interval ms] [--tolerance 0-255]
+  windows-session-ctl wait <criteria> [--move | --gone] [--timeout s] [--interval ms] [--tolerance 0-255]
         wait until every criterion is on screen (default 60 s, every 500 ms); prints a JSON array with one entry per
         place found, each with "rect" {x,y,w,h} (see it with: screenshot out.png --rect x,y,w,h) and "center";
         if not found within --timeout it prints [] and exits with 124
@@ -70,6 +70,7 @@ const USAGE = `Drive the Windows desktop session a user is logged into (RDP or c
         a --control with neither after it is a criterion too: the control itself is on screen
         where to look: --window <w> [--control <name|id> [--beside <text>]] applies to the criteria AFTER it; --screen goes back to all of it
         --gone: wait until none of the criteria is found any more (prints [])
+        --move: then put the pointer on the "center" of the first entry; a following \`mouse click\` (no x y) clicks there
   windows-session-ctl launch <exe> [args]           start a program in the session, do not wait
   windows-session-ctl exec <cmd-command> [--timeout s]  run a CMD command/batch script in the session (arg, or stdin when piped), wait, print stdout; exit code passed through
   windows-session-ctl psexec <powershell> [--timeout s]  same, for PowerShell
@@ -411,6 +412,7 @@ function waitCriteria() {
 }
 async function runWait() {
   if (a.length) die(`wait: unexpected argument '${a[0]}' (use --text or --image)`);
+  if (flags.move && flags.gone) die("wait: --move cannot be used with --gone, which finds nothing to move to");
   const { criteria, images } = waitCriteria();
   const number = (name, fallback, max = Infinity) => { const v = Number(flags[name] ?? fallback); if (!(v >= 0 && v <= max)) die(`wait: bad --${name} '${flags[name]}'`); return v; };
   const timeout = number("timeout", 60), interval = number("interval", 500), tolerance = number("tolerance", 10, 255);
@@ -427,9 +429,11 @@ async function runWait() {
     const elapsed = (Date.now() - start) / 1000;
     if (r.results.every(wanted)) { // one array entry per place found; with --gone there is none
       if (flags.gone) return print([]);
-      return print(r.results.flatMap((x, i) => { const { image, ...q } = criteria[i];
+      const found = r.results.flatMap((x, i) => { const { image, ...q } = criteria[i];
         return x.matches.map((m) => ({ ...(image && { image: images.get(image).file }), ...q, ...m,
-          center: { x: m.rect.x + (m.rect.w >> 1), y: m.rect.y + (m.rect.h >> 1) } })); }));
+          center: { x: m.rect.x + (m.rect.w >> 1), y: m.rect.y + (m.rect.h >> 1) } })); });
+      if (flags.move) await rpc("mouse", { action: "move", ...found[0].center });
+      return print(found);
     }
     if (elapsed >= timeout) {
       const missing = r.results.flatMap((x, i) => { const q = criteria[i]; if (wanted(x)) return [];
@@ -451,7 +455,7 @@ for (let i = 0; i < argv.length; i++) {
   const f = argv[i] === "-p" ? "--profile" : argv[i];
   if (pos[0] === "wait") {
     if (f === "--screen") { waitArgs.push([f]); continue; }
-    if (f === "--gone") { flags.gone = true; continue; }
+    if (f === "--gone" || f === "--move") { flags[f.slice(2)] = true; continue; }
     if (["--window", "--control", "--beside", "--text", "--image"].includes(f)) { waitArgs.push([f, argv[++i]]); continue; }
     if (["--interval", "--tolerance"].includes(f)) { flags[f.slice(2)] = argv[++i]; continue; }
   }

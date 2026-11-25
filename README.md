@@ -256,6 +256,7 @@ windows-session-ctl wait --window "My App" --image done.png --control Status --t
 windows-session-ctl wait --window Notepad --text saved --screen --image tray-icon.png
 windows-session-ctl wait --window "My App" --control OkButton                  # until a control exists
 windows-session-ctl wait --window "My App" --text Installing --gone            # until it disappears
+windows-session-ctl wait --image ok-button.png --move && windows-session-ctl mouse click   # find it, click it
 ```
 
 | Option | Meaning |
@@ -266,6 +267,7 @@ windows-session-ctl wait --window "My App" --text Installing --gone            #
 | `--control C` | Look only in this control of that window (name or automation id), for the criteria after it. With no `--text` or `--image` after it, the criterion is the control itself being on screen. |
 | `--beside S` | Narrow that `--control` to the one next to the text `S` (see *Matching rules*). |
 | `--gone` | Wait until **none** of the criteria is found. Prints `[]`; on timeout the exit code is 124. A window or control that does not exist counts as gone. |
+| `--move` | When found, move the pointer to the `center` of the **first** output entry. Not with `--gone`. |
 | `--screen` | Look at the whole screen again, for the criteria after it (the default at the start). |
 | `--timeout s` | Give up if not found after `s` seconds (default 60): print `[]` and exit with code **124**. |
 | `--interval ms` | Pause between checks (default 500). |
@@ -288,6 +290,11 @@ An entry also repeats its `window` / `control` if given; a text entry has `text`
 `name` of the control showing it. If time runs out the array is empty (`[]`), stderr says what was missing, and the exit
 code is 124. Image places never overlap, and each criterion reports at most 100 places. `--timeout 0` checks once. A
 check already running when the time is up is finished first.
+
+With `--move`, a following `mouse click` (or `dblclick`, `rclick`, `scroll`) without coordinates acts on the place that
+was found, protected by the *Resolution-change guard*. The pointer goes to the first entry: that of the first criterion
+given, and its topmost place for an image. Moving does not bring a window to the front, and `--text` and `--control` can
+find things in a covered window: `focus` it first.
 
 To see what was matched, capture an entry's `rect`:
 
